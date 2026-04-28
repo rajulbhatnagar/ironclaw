@@ -78,6 +78,13 @@ pub struct PendingGate {
     /// Whether approval has already been granted for this paused action.
     #[serde(default)]
     pub approval_already_granted: bool,
+    /// Identifier of the originating job when the gate was created inside a
+    /// job worker (sandbox, ACP container, etc.). `None` for chat-originated
+    /// gates. Lets surfaces that are job-scoped (e.g. the Jobs tab Activity
+    /// subtab) discover gates that belong to a job without reverse-mapping
+    /// from `thread_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<Uuid>,
 }
 
 impl PendingGate {
@@ -163,6 +170,7 @@ mod tests {
             resume_output: None,
             paused_lease: None,
             approval_already_granted: false,
+            job_id: None,
         }
     }
 
@@ -192,5 +200,27 @@ mod tests {
         let view = PendingGateView::from(&gate);
         assert_eq!(view.tool_name, "shell");
         assert_eq!(view.gate_name, "approval");
+    }
+
+    #[test]
+    fn test_job_id_round_trip_via_serde() {
+        let mut gate = sample_gate(300);
+        let job_id = Uuid::new_v4();
+        gate.job_id = Some(job_id);
+        let json = serde_json::to_string(&gate).expect("serialize");
+        let back: PendingGate = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.job_id, Some(job_id));
+    }
+
+    #[test]
+    fn test_job_id_defaults_to_none_when_absent() {
+        let gate = sample_gate(300);
+        let json = serde_json::to_string(&gate).expect("serialize");
+        assert!(
+            !json.contains("job_id"),
+            "job_id should be skipped when None: {json}"
+        );
+        let back: PendingGate = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.job_id, None);
     }
 }

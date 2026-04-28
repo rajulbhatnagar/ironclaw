@@ -21,6 +21,11 @@ pub use cost_guard_gate::CostGuardBudgetGate;
 pub use workspace_reader::WorkspaceReaderAdapter;
 
 pub use effect_adapter::EffectBridgeAdapter;
+pub(crate) use router::pending_gate_to_app_event;
+pub use router::{
+    ACP_PERMISSION_GATE_NAME, engine_pending_gate_store, peek_pending_gate_by_request_id,
+    take_verified_acp_permission_gate,
+};
 pub use router::{
     // DTO types
     AttentionItem,

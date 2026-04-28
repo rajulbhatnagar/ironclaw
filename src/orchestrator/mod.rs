@@ -28,11 +28,13 @@
 //! └───────────────────────────────────────────────┘
 //! ```
 
+pub mod acp_permissions;
 pub mod api;
 pub mod auth;
 pub mod job_manager;
 pub mod reaper;
 
+pub use acp_permissions::AcpPermissionStore;
 pub use api::OrchestratorApi;
 pub use auth::{CredentialGrant, TokenStore};
 pub use job_manager::{
@@ -66,6 +68,13 @@ pub struct OrchestratorSetup {
     pub job_event_tx: Option<broadcast::Sender<(Uuid, String, AppEvent)>>,
     pub prompt_queue: Arc<Mutex<HashMap<Uuid, VecDeque<api::PendingPrompt>>>>,
     pub docker_status: crate::sandbox::DockerStatus,
+    /// Shared with the web gateway so `/api/chat/gate/resolve` can wake the
+    /// ACP bridge's long-polling `request_permission`. `None` when the
+    /// sandbox isn't running.
+    pub acp_permissions: Option<Arc<AcpPermissionStore>>,
+    /// Shutdown signal for orchestrator-owned background tasks (ACP
+    /// permission expiry sweeper). Dropping the sender stops the loops.
+    pub shutdown: Option<tokio::sync::watch::Sender<()>>,
 }
 
 /// Detect Docker availability, create the container job manager, and start
@@ -105,9 +114,12 @@ pub async fn setup_orchestrator(
         crate::sandbox::DockerStatus::Disabled
     };
 
-    let (job_event_tx, container_job_manager) = if config.sandbox.enabled && docker_status.is_ok() {
+    let (job_event_tx, container_job_manager, acp_permissions, shutdown) = if config.sandbox.enabled
+        && docker_status.is_ok()
+    {
         let (tx, _) = broadcast::channel(256);
         let job_event_tx = Some(tx);
+        let (shutdown_tx, _) = tokio::sync::watch::channel(());
 
         let token_store = TokenStore::new();
         let orchestrator_port = resolve_orchestrator_port();
@@ -132,6 +144,20 @@ pub async fn setup_orchestrator(
         };
         let jm = Arc::new(ContainerJobManager::new(job_config, token_store.clone()));
 
+        let acp_permissions = Arc::new(AcpPermissionStore::new());
+        let sweep_store = Arc::clone(&acp_permissions);
+        let mut sweep_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => { sweep_store.expire_stale().await; }
+                    _ = sweep_shutdown.changed() => break,
+                }
+            }
+        });
+
         let orchestrator_state = api::OrchestratorState {
             llm: Arc::clone(llm),
             job_manager: Arc::clone(&jm),
@@ -141,6 +167,12 @@ pub async fn setup_orchestrator(
             store: db.cloned(),
             secrets_store: secrets_store.cloned(),
             job_owner_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            // Engine-owned `PendingGateStore` is looked up lazily by the
+            // permission handler via `bridge::engine_pending_gate_store`,
+            // since engine init runs after orchestrator setup. Tests inject
+            // a store here to avoid the global lookup.
+            pending_gates: None,
+            acp_permissions: Arc::clone(&acp_permissions),
         };
 
         tokio::spawn(async move {
@@ -159,9 +191,14 @@ pub async fn setup_orchestrator(
         if config.acp.enabled {
             tracing::info!("ACP agent sandbox mode available");
         }
-        (job_event_tx, Some(jm))
+        (
+            job_event_tx,
+            Some(jm),
+            Some(acp_permissions),
+            Some(shutdown_tx),
+        )
     } else {
-        (None, None)
+        (None, None, None, None)
     };
 
     OrchestratorSetup {
@@ -169,6 +206,8 @@ pub async fn setup_orchestrator(
         job_event_tx,
         prompt_queue,
         docker_status,
+        acp_permissions,
+        shutdown,
     }
 }
 

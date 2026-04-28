@@ -101,6 +101,17 @@ pub async fn run_acp_bridge(job_id: uuid::Uuid, orchestrator_url: &str) -> anyho
         agent_args.join(" ")
     );
 
+    // Opt-in: surface ACP permission requests to the orchestrator (and
+    // ultimately to the user via the web UI) when
+    // `IRONCLAW_ACP_SURFACE_PERMISSIONS` is truthy. Default is `false`,
+    // preserving legacy auto-approve behavior — the Docker sandbox stays
+    // the primary boundary. The host populates this env var from the
+    // per-agent `surface_permissions` flag in `AcpAgentConfig`.
+    let surface_permissions = match std::env::var("IRONCLAW_ACP_SURFACE_PERMISSIONS") {
+        Ok(v) => v.eq_ignore_ascii_case("true") || v == "1",
+        Err(_) => false,
+    };
+
     let config = acp_bridge::AcpBridgeConfig {
         job_id,
         orchestrator_url: orchestrator_url.to_string(),
@@ -108,6 +119,7 @@ pub async fn run_acp_bridge(job_id: uuid::Uuid, orchestrator_url: &str) -> anyho
         agent_command,
         agent_args,
         agent_env,
+        surface_permissions,
     };
 
     let rt = AcpBridgeRuntime::new(config)

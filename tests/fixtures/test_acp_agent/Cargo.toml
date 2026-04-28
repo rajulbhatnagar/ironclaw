@@ -1,0 +1,16 @@
+[package]
+name = "test_acp_agent"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Minimal ACP agent binary used by e2e tests. Always defers its first prompt to request_permission so the IronClaw host surfaces an approval gate."
+
+[[bin]]
+name = "test_acp_agent"
+path = "src/main.rs"
+
+[dependencies]
+agent-client-protocol = "0.10"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "macros", "io-std"] }
+tokio-util = { version = "0.7", features = ["compat"] }

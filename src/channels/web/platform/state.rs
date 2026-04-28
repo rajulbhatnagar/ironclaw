@@ -464,6 +464,11 @@ pub struct GatewayState {
     /// Channel-agnostic tool dispatcher for routing handler operations through
     /// the tool pipeline with audit trail.
     pub tool_dispatcher: Option<Arc<crate::tools::dispatch::ToolDispatcher>>,
+    /// Orchestrator-side correlation store for deferred ACP permission
+    /// requests. Populated only when the sandbox orchestrator is running;
+    /// `None` when sandboxing is disabled. The chat resolve handler writes
+    /// decisions here to wake the ACP bridge's long-poll.
+    pub acp_permissions: Option<Arc<crate::orchestrator::AcpPermissionStore>>,
 }
 
 /// Cached result of `build_frontend_html()`, keyed by a cheap workspace

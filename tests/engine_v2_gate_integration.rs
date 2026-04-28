@@ -686,6 +686,7 @@ fn sample_pending_gate(
         paused_lease: None,
         resume_output: None,
         approval_already_granted: false,
+        job_id: None,
     }
 }
 

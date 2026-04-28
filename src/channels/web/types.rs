@@ -150,6 +150,36 @@ pub struct PendingGateInfo {
     pub resume_kind: serde_json::Value,
 }
 
+/// A single pending gate linked to a job.
+///
+/// Returned by `GET /api/jobs/pending-gates` so the Jobs tab can render
+/// approval cards inline for gates that originated from a containerised
+/// worker (ACP agent, future Claude-bridge, routine jobs). All surface
+/// fields mirror what the frontend `buildApprovalCard` helper consumes.
+#[derive(Debug, Serialize)]
+pub struct PendingJobGateDto {
+    pub job_id: Uuid,
+    pub request_id: String,
+    pub thread_id: String,
+    pub gate_name: String,
+    pub tool_name: String,
+    pub description: String,
+    pub parameters: String,
+    /// Re-uses the engine's typed enum rather than an opaque
+    /// `serde_json::Value`. The Chat-side `PendingGateInfo` is stringly-
+    /// typed only for legacy reasons; new endpoints ship strict.
+    pub resume_kind: ironclaw_engine::ResumeKind,
+    /// Whether the agent offered an AllowAlways option (convenience for
+    /// the UI so the card doesn't need to re-interpret `resume_kind`).
+    pub allow_always: bool,
+}
+
+/// Response body for `GET /api/jobs/pending-gates`.
+#[derive(Debug, Serialize)]
+pub struct PendingJobGatesResponse {
+    pub gates: Vec<PendingJobGateDto>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InProgressInfo {
     pub turn_number: usize,

@@ -1,15 +1,22 @@
-function showApproval(data) {
-  // Avoid duplicate cards on reconnect/history refresh.
-  const existing = document.querySelector('.approval-card[data-request-id="' + CSS.escape(data.request_id) + '"]');
-  if (existing) return;
+// Build an approval-card DOM node for a gate. Shared between chat (appended
+// to #chat-messages) and the Jobs tab (rendered into #job-pending-gates).
+// `onResolve(action)` fires when the user clicks Approve / Always / Deny —
+// the default wires to `sendApprovalAction` so chat behaves identically.
+function buildApprovalCard(data, opts) {
+  const options = opts || {};
+  const parent = options.parent || document.getElementById('chat-messages');
+  const threadId = data.thread_id || (typeof currentThreadId !== 'undefined' ? currentThreadId : null);
+  const onResolve = options.onResolve || ((action) => sendApprovalAction(data.request_id, action, threadId));
 
-  const container = document.getElementById('chat-messages');
+  // Avoid duplicate cards for the same request within the same parent.
+  const existing = parent.querySelector('.approval-card[data-request-id="' + CSS.escape(data.request_id) + '"]');
+  if (existing) return existing;
+
   const card = document.createElement('div');
   card.className = 'approval-card';
   card.setAttribute('data-request-id', data.request_id);
-  const cardThreadId = data.thread_id || currentThreadId;
-  if (cardThreadId) {
-    card.setAttribute('data-thread-id', cardThreadId);
+  if (threadId) {
+    card.setAttribute('data-thread-id', threadId);
   }
 
   const header = document.createElement('div');
@@ -52,26 +59,32 @@ function showApproval(data) {
   const approveBtn = document.createElement('button');
   approveBtn.className = 'approve';
   approveBtn.textContent = I18n.t('approval.approve');
-  approveBtn.addEventListener('click', () => sendApprovalAction(data.request_id, 'approve', cardThreadId));
+  approveBtn.addEventListener('click', () => onResolve('approve'));
 
   const denyBtn = document.createElement('button');
   denyBtn.className = 'deny';
   denyBtn.textContent = I18n.t('approval.deny');
-  denyBtn.addEventListener('click', () => sendApprovalAction(data.request_id, 'deny', cardThreadId));
+  denyBtn.addEventListener('click', () => onResolve('deny'));
 
   actions.appendChild(approveBtn);
   if (data.allow_always !== false) {
     const alwaysBtn = document.createElement('button');
     alwaysBtn.className = 'always';
     alwaysBtn.textContent = I18n.t('approval.always');
-    alwaysBtn.addEventListener('click', () => sendApprovalAction(data.request_id, 'always', cardThreadId));
+    alwaysBtn.addEventListener('click', () => onResolve('always'));
     actions.appendChild(alwaysBtn);
   }
   actions.appendChild(denyBtn);
   card.appendChild(actions);
 
-  container.appendChild(card);
-  container.scrollTop = container.scrollHeight;
+  parent.appendChild(card);
+  return card;
+}
+
+function showApproval(data) {
+  const parent = document.getElementById('chat-messages');
+  buildApprovalCard(data, { parent });
+  parent.scrollTop = parent.scrollHeight;
 }
 
 // --- Plan Checklist ---

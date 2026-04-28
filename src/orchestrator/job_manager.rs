@@ -309,6 +309,13 @@ impl ContainerJobManager {
             {
                 env_vec.push(format!("ACP_AGENT_ENV={}", json));
             }
+            // Propagate the per-agent opt-in for surfacing
+            // `request_permission` calls to the user. Only emit when
+            // enabled — absence of the var defaults to auto-approve in the
+            // bridge (see `src/worker/mod.rs::run_acp_bridge`).
+            if agent.surface_permissions {
+                env_vec.push("IRONCLAW_ACP_SURFACE_PERMISSIONS=true".to_string());
+            }
         }
     }
 
@@ -1159,6 +1166,33 @@ mod tests {
             env_vec
                 .iter()
                 .any(|entry| entry.starts_with("ACP_AGENT_ENV="))
+        );
+        // Default surface_permissions is false → env var must be absent.
+        assert!(
+            !env_vec
+                .iter()
+                .any(|entry| entry.starts_with("IRONCLAW_ACP_SURFACE_PERMISSIONS="))
+        );
+    }
+
+    #[test]
+    fn test_extend_acp_env_emits_surface_permissions_when_opted_in() {
+        let manager = ContainerJobManager::new(ContainerJobConfig::default(), TokenStore::new());
+
+        let mut agent = crate::config::acp::AcpAgentConfig::new(
+            "codex",
+            "codex",
+            vec!["acp".into()],
+            HashMap::new(),
+        );
+        agent.surface_permissions = true;
+
+        let mut env_vec = Vec::new();
+        manager.extend_acp_env(&mut env_vec, Some(&agent));
+
+        assert!(
+            env_vec.contains(&"IRONCLAW_ACP_SURFACE_PERMISSIONS=true".to_string()),
+            "opt-in per agent must propagate to container env; got {env_vec:?}"
         );
     }
     // ── generate_worker_mcp_config tests ────────────────────────────

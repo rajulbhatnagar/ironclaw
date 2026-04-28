@@ -6,8 +6,23 @@
 //! IronClaw's `JobEventPayload` stream and posted to the orchestrator.
 //!
 //! Security model: the Docker container is the primary security boundary
-//! (cap-drop ALL, non-root user, memory limits, network isolation).
-//! Agent permissions are auto-approved since the container is isolated.
+//! (cap-drop ALL, non-root user, memory limits, network isolation). By
+//! default, ACP `request_permission` calls are auto-approved in the
+//! container — the sandbox is the only layer.
+//!
+//! For an optional second, user-consent layer, set
+//! `surface_permissions=true` on a per-agent basis in
+//! `~/.ironclaw/acp-agents.json` (or the DB `acp_agents` setting). The
+//! host propagates this to the container as
+//! `IRONCLAW_ACP_SURFACE_PERMISSIONS=true`. When enabled, the bridge
+//! defers each `request_permission` to the orchestrator over HTTP, which
+//! inserts a `PendingGate` (gate_name = `acp_permission`) and broadcasts
+//! `AppEvent::GateRequired`. The user resolves via the existing
+//! `/api/chat/gate/resolve` web endpoint; the resolve handler
+//! short-circuits `acp_permission` gates and forwards a `PermissionDecision`
+//! back to the bridge, which returns it as the ACP
+//! `RequestPermissionOutcome`. On timeout (10 minutes), the bridge
+//! returns `Cancelled` — safe default on user inactivity.
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────┐
@@ -35,7 +50,10 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
 use crate::error::WorkerError;
-use crate::worker::api::{CompletionReport, JobEventPayload, WorkerHttpClient};
+use crate::worker::api::{
+    CompletionReport, JobEventPayload, PermissionDecision, PermissionOptionDto,
+    PermissionOptionKindDto, PermissionRequestRegister, WorkerHttpClient,
+};
 
 /// Configuration for the ACP bridge runtime.
 pub struct AcpBridgeConfig {
@@ -48,6 +66,11 @@ pub struct AcpBridgeConfig {
     pub agent_args: Vec<String>,
     /// Extra environment variables for the agent process.
     pub agent_env: HashMap<String, String>,
+    /// Whether to surface `request_permission` calls from the ACP agent to
+    /// the end user via the orchestrator, instead of auto-approving the
+    /// first option. The Docker sandbox is still the primary security
+    /// boundary; this adds a second, user-consent layer.
+    pub surface_permissions: bool,
 }
 
 /// The ACP bridge runtime.
@@ -194,6 +217,7 @@ impl AcpBridgeRuntime {
         let prompt_owned = prompt.to_string();
         let job_id = self.config.job_id;
         let timeout = self.config.timeout;
+        let surface_permissions = self.config.surface_permissions;
 
         // Clone client for follow-up loop
         let client_for_followup = Arc::clone(&self.client);
@@ -208,8 +232,12 @@ impl AcpBridgeRuntime {
                 let outgoing = child_stdin.compat_write();
                 let incoming = child_stdout.compat();
 
-                // Create ACP connection
-                let ironclaw_client = IronClawAcpClient::new(Arc::clone(&client_for_acp));
+                // Create ACP connection. The bridge runs inside a Docker
+                // container; `surface_permissions` determines whether
+                // `request_permission` is deferred to the host (user click in
+                // the web UI) or auto-approved.
+                let ironclaw_client =
+                    IronClawAcpClient::new(Arc::clone(&client_for_acp), surface_permissions);
 
                 let (conn, handle_io) =
                     acp::ClientSideConnection::new(ironclaw_client, outgoing, incoming, |fut| {
@@ -226,7 +254,14 @@ impl AcpBridgeRuntime {
                 tracing::info!(job_id = %job_id, "ACP handshake complete");
 
                 // Create a new session
-                let workspace = std::env::current_dir().unwrap_or_else(|_| "/workspace".into());
+                let workspace = std::env::current_dir().unwrap_or_else(|e| {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        error = %e,
+                        "failed to read current_dir; falling back to /workspace",
+                    );
+                    "/workspace".into()
+                });
                 let session_response = conn
                     .new_session(acp::NewSessionRequest::new(workspace))
                     .await
@@ -302,13 +337,48 @@ impl AcpBridgeRuntime {
 ///
 /// The bridge posts events to the orchestrator via HTTP; the CLI test
 /// command prints them to stdout. Both share the same `IronClawAcpClient`.
-pub(crate) trait AcpEventSink: 'static {
+#[doc(hidden)]
+pub trait AcpEventSink: 'static {
     fn emit_event(&self, payload: &JobEventPayload) -> impl std::future::Future<Output = ()>;
 }
 
 impl AcpEventSink for Arc<WorkerHttpClient> {
     async fn emit_event(&self, payload: &JobEventPayload) {
         self.post_event(payload).await;
+    }
+}
+
+/// Gateway for deferring ACP permission decisions to the orchestrator.
+///
+/// The bridge holds one of these so `request_permission` can register a
+/// pending gate and long-poll for the user's decision, instead of
+/// auto-approving.
+#[doc(hidden)]
+pub trait AcpPermissionGateway: 'static {
+    fn register_permission(
+        &self,
+        req: &PermissionRequestRegister,
+    ) -> impl std::future::Future<Output = Result<(), WorkerError>>;
+
+    fn poll_permission(
+        &self,
+        permission_id: Uuid,
+    ) -> impl std::future::Future<Output = Result<Option<PermissionDecision>, WorkerError>>;
+}
+
+impl AcpPermissionGateway for Arc<WorkerHttpClient> {
+    async fn register_permission(
+        &self,
+        req: &PermissionRequestRegister,
+    ) -> Result<(), WorkerError> {
+        WorkerHttpClient::register_permission(self, req).await
+    }
+
+    async fn poll_permission(
+        &self,
+        permission_id: Uuid,
+    ) -> Result<Option<PermissionDecision>, WorkerError> {
+        WorkerHttpClient::poll_permission(self, permission_id).await
     }
 }
 
@@ -337,33 +407,130 @@ trait AcpPromptSender {
 /// IronClaw's implementation of the ACP Client trait.
 ///
 /// Handles callbacks from the agent: session notifications (streaming output)
-/// and permission requests (auto-approved). Generic over the event sink so
-/// both the container bridge and CLI test command can reuse it.
-pub(crate) struct IronClawAcpClient<S: AcpEventSink> {
+/// and permission requests. When `surface_permissions` is `true`, permission
+/// requests are deferred to the orchestrator via `AcpPermissionGateway` and
+/// the agent blocks until the user resolves the gate in the web UI. When
+/// `false`, permission requests are auto-approved (legacy: container is the
+/// sole boundary).
+///
+/// Generic over the event sink + gateway so both the container bridge and
+/// CLI test command can reuse it.
+#[doc(hidden)]
+pub struct IronClawAcpClient<S: AcpEventSink + AcpPermissionGateway> {
     sink: S,
+    surface_permissions: bool,
+    permission_timeout: Duration,
 }
 
-impl<S: AcpEventSink> IronClawAcpClient<S> {
-    pub(crate) fn new(sink: S) -> Self {
-        Self { sink }
+impl<S: AcpEventSink + AcpPermissionGateway> IronClawAcpClient<S> {
+    #[doc(hidden)]
+    pub fn new(sink: S, surface_permissions: bool) -> Self {
+        Self {
+            sink,
+            surface_permissions,
+            permission_timeout: ACP_PERMISSION_TIMEOUT,
+        }
+    }
+
+    /// Override the overall permission-request timeout. Intended for tests
+    /// that exercise the inactivity-to-Cancelled branch in bounded time.
+    #[cfg(test)]
+    pub(crate) fn with_permission_timeout(mut self, timeout: Duration) -> Self {
+        self.permission_timeout = timeout;
+        self
     }
 }
 
+/// Overall deadline for a single ACP permission request when
+/// `surface_permissions=true`. If the user hasn't resolved the gate within
+/// this window, we return `Cancelled` to the ACP agent — safe default on
+/// inactivity.
+const ACP_PERMISSION_TIMEOUT: Duration = Duration::from_secs(600);
+/// Backoff between poll retries after a transient error.
+const ACP_PERMISSION_POLL_BACKOFF: Duration = Duration::from_secs(2);
+
 #[async_trait::async_trait(?Send)]
-impl<S: AcpEventSink> acp::Client for IronClawAcpClient<S> {
+impl<S: AcpEventSink + AcpPermissionGateway> acp::Client for IronClawAcpClient<S> {
     async fn request_permission(
         &self,
         args: acp::RequestPermissionRequest,
     ) -> acp::Result<acp::RequestPermissionResponse> {
-        // Auto-approve by selecting the first option — Docker container is the
-        // security boundary, so we trust the agent to operate freely.
-        let Some(first_option) = args.options.first() else {
+        if !self.surface_permissions {
+            // Legacy behavior: auto-select first option. Docker container is
+            // the security boundary.
+            let Some(first_option) = args.options.first() else {
+                return Err(acp::Error::invalid_params());
+            };
+            let option_id = first_option.option_id.clone();
+            return Ok(acp::RequestPermissionResponse::new(
+                acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+                    option_id,
+                )),
+            ));
+        }
+
+        if args.options.is_empty() {
             return Err(acp::Error::invalid_params());
-        };
-        let option_id = first_option.option_id.clone();
-        Ok(acp::RequestPermissionResponse::new(
-            acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(option_id)),
-        ))
+        }
+
+        let permission_id = Uuid::new_v4();
+        let payload = build_register_payload(permission_id, &args);
+
+        if let Err(e) = self.sink.register_permission(&payload).await {
+            tracing::warn!(
+                permission_id = %permission_id,
+                "ACP permission registration failed: {}. Defaulting to Cancelled.",
+                e
+            );
+            return Ok(acp::RequestPermissionResponse::new(
+                acp::RequestPermissionOutcome::Cancelled,
+            ));
+        }
+
+        let deadline = tokio::time::Instant::now() + self.permission_timeout;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    permission_id = %permission_id,
+                    "ACP permission request timed out after {:?}. Returning Cancelled.",
+                    self.permission_timeout,
+                );
+                return Ok(acp::RequestPermissionResponse::new(
+                    acp::RequestPermissionOutcome::Cancelled,
+                ));
+            }
+
+            match self.sink.poll_permission(permission_id).await {
+                Ok(Some(PermissionDecision::Selected { option_id })) => {
+                    return Ok(acp::RequestPermissionResponse::new(
+                        acp::RequestPermissionOutcome::Selected(
+                            acp::SelectedPermissionOutcome::new(acp::PermissionOptionId::new(
+                                option_id,
+                            )),
+                        ),
+                    ));
+                }
+                Ok(Some(PermissionDecision::Cancelled)) => {
+                    return Ok(acp::RequestPermissionResponse::new(
+                        acp::RequestPermissionOutcome::Cancelled,
+                    ));
+                }
+                Ok(None) => {
+                    // 204 No Content — server poll window elapsed. Yield
+                    // briefly so we don't tight-loop when the client is
+                    // mocked / the server returns 204 instantly.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        permission_id = %permission_id,
+                        "ACP permission poll failed: {}. Retrying.",
+                        e
+                    );
+                    tokio::time::sleep(ACP_PERMISSION_POLL_BACKOFF).await;
+                }
+            }
+        }
     }
 
     async fn session_notification(&self, args: acp::SessionNotification) -> acp::Result<()> {
@@ -374,8 +541,65 @@ impl<S: AcpEventSink> acp::Client for IronClawAcpClient<S> {
     }
 }
 
+/// Translate an ACP `PermissionOptionKind` to the wire-stable enum.
+fn permission_option_kind_to_dto(kind: acp::PermissionOptionKind) -> PermissionOptionKindDto {
+    match kind {
+        acp::PermissionOptionKind::AllowOnce => PermissionOptionKindDto::AllowOnce,
+        acp::PermissionOptionKind::AllowAlways => PermissionOptionKindDto::AllowAlways,
+        acp::PermissionOptionKind::RejectOnce => PermissionOptionKindDto::RejectOnce,
+        acp::PermissionOptionKind::RejectAlways => PermissionOptionKindDto::RejectAlways,
+        // The ACP enum is `#[non_exhaustive]`; treat unknowns as a rejection
+        // hint so we never silently widen permission.
+        _ => PermissionOptionKindDto::RejectOnce,
+    }
+}
+
+fn build_register_payload(
+    permission_id: Uuid,
+    args: &acp::RequestPermissionRequest,
+) -> PermissionRequestRegister {
+    let options = args
+        .options
+        .iter()
+        .map(|opt| PermissionOptionDto {
+            option_id: opt.option_id.to_string(),
+            name: opt.name.clone(),
+            kind: permission_option_kind_to_dto(opt.kind),
+        })
+        .collect();
+    let tool_name = args
+        .tool_call
+        .fields
+        .title
+        .clone()
+        .unwrap_or_else(|| "(unknown)".to_string());
+    let tool_kind = args
+        .tool_call
+        .fields
+        .kind
+        .and_then(|k| serde_json::to_value(k).ok())
+        .and_then(|v| v.as_str().map(|s| s.to_string()));
+    let locations = args
+        .tool_call
+        .fields
+        .locations
+        .as_ref()
+        .map(|ls| ls.iter().map(|l| l.path.display().to_string()).collect())
+        .unwrap_or_default();
+    PermissionRequestRegister {
+        permission_id,
+        tool_call_id: args.tool_call.tool_call_id.to_string(),
+        tool_name,
+        tool_kind,
+        raw_input: args.tool_call.fields.raw_input.clone(),
+        locations,
+        options,
+    }
+}
+
 /// Build the standard IronClaw ACP initialization request.
-pub(crate) fn ironclaw_init_request() -> acp::InitializeRequest {
+#[doc(hidden)]
+pub fn ironclaw_init_request() -> acp::InitializeRequest {
     acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_info(
         acp::Implementation::new("ironclaw", env!("CARGO_PKG_VERSION")).title("IronClaw"),
     )
@@ -1089,6 +1313,241 @@ mod tests {
             "Error message should indicate permanent failure, got: {msg}"
         );
     }
+
+    // ==================== request_permission tests ====================
+
+    use acp::Client as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Mutex as AsyncMutex;
+
+    /// Stub permission gateway that drives `request_permission`.
+    ///
+    /// `poll_results` is a queue — each call to `poll_permission` pops one.
+    /// When drained, returns `Ok(None)` forever, which exercises the timeout
+    /// branch when paired with `tokio::test(start_paused = true)`.
+    struct StubPermissionGateway {
+        register_result: AsyncMutex<Option<Result<(), WorkerError>>>,
+        register_calls: AtomicUsize,
+        poll_results: AsyncMutex<Vec<Result<Option<PermissionDecision>, WorkerError>>>,
+    }
+
+    impl StubPermissionGateway {
+        fn new(
+            register_result: Result<(), WorkerError>,
+            mut poll_results: Vec<Result<Option<PermissionDecision>, WorkerError>>,
+        ) -> Self {
+            poll_results.reverse(); // pop() takes from the end
+            Self {
+                register_result: AsyncMutex::new(Some(register_result)),
+                register_calls: AtomicUsize::new(0),
+                poll_results: AsyncMutex::new(poll_results),
+            }
+        }
+    }
+
+    impl AcpEventSink for StubPermissionGateway {
+        async fn emit_event(&self, _payload: &JobEventPayload) {}
+    }
+
+    impl AcpPermissionGateway for StubPermissionGateway {
+        async fn register_permission(
+            &self,
+            _req: &PermissionRequestRegister,
+        ) -> Result<(), WorkerError> {
+            self.register_calls.fetch_add(1, Ordering::SeqCst);
+            self.register_result.lock().await.take().unwrap_or(Ok(()))
+        }
+
+        async fn poll_permission(
+            &self,
+            _permission_id: Uuid,
+        ) -> Result<Option<PermissionDecision>, WorkerError> {
+            self.poll_results.lock().await.pop().unwrap_or(Ok(None))
+        }
+    }
+
+    fn sample_request() -> acp::RequestPermissionRequest {
+        let fields = acp::ToolCallUpdateFields::new()
+            .title(Some("shell".to_string()))
+            .kind(Some(acp::ToolKind::Execute));
+        acp::RequestPermissionRequest::new(
+            acp::SessionId::new("test-session"),
+            acp::ToolCallUpdate::new("tc-1", fields),
+            vec![
+                acp::PermissionOption::new(
+                    "allow-once",
+                    "Allow once",
+                    acp::PermissionOptionKind::AllowOnce,
+                ),
+                acp::PermissionOption::new(
+                    "reject",
+                    "Reject",
+                    acp::PermissionOptionKind::RejectOnce,
+                ),
+            ],
+        )
+    }
+
+    #[tokio::test]
+    async fn request_permission_auto_approves_when_surface_permissions_false() {
+        let gateway = StubPermissionGateway::new(Ok(()), vec![]);
+        let client = IronClawAcpClient::new(gateway, false);
+
+        let resp = client.request_permission(sample_request()).await.unwrap();
+        match resp.outcome {
+            acp::RequestPermissionOutcome::Selected(sel) => {
+                assert_eq!(sel.option_id.to_string(), "allow-once");
+            }
+            other => panic!("expected Selected, got {other:?}"),
+        }
+        // No HTTP calls in legacy mode.
+        assert_eq!(
+            client.sink.register_calls.load(Ordering::SeqCst),
+            0,
+            "legacy mode must not call the orchestrator"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_permission_returns_selected_when_gateway_yields_decision() {
+        let gateway = StubPermissionGateway::new(
+            Ok(()),
+            vec![Ok(Some(PermissionDecision::Selected {
+                option_id: "reject".to_string(),
+            }))],
+        );
+        let client = IronClawAcpClient::new(gateway, true);
+
+        let resp = client.request_permission(sample_request()).await.unwrap();
+        match resp.outcome {
+            acp::RequestPermissionOutcome::Selected(sel) => {
+                assert_eq!(sel.option_id.to_string(), "reject");
+            }
+            other => panic!("expected Selected, got {other:?}"),
+        }
+        assert_eq!(client.sink.register_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn request_permission_returns_cancelled_when_gateway_yields_cancelled() {
+        let gateway =
+            StubPermissionGateway::new(Ok(()), vec![Ok(Some(PermissionDecision::Cancelled))]);
+        let client = IronClawAcpClient::new(gateway, true);
+
+        let resp = client.request_permission(sample_request()).await.unwrap();
+        assert!(matches!(
+            resp.outcome,
+            acp::RequestPermissionOutcome::Cancelled
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_permission_returns_cancelled_when_register_fails() {
+        let gateway = StubPermissionGateway::new(
+            Err(WorkerError::ConnectionFailed {
+                url: "http://test".to_string(),
+                reason: "boom".to_string(),
+            }),
+            vec![],
+        );
+        let client = IronClawAcpClient::new(gateway, true);
+
+        let resp = client.request_permission(sample_request()).await.unwrap();
+        assert!(
+            matches!(resp.outcome, acp::RequestPermissionOutcome::Cancelled),
+            "register failure must default to Cancelled (safe default)"
+        );
+    }
+
+    /// Timeout branch: gateway always returns `Ok(None)`; a short injected
+    /// timeout ensures the loop exits quickly.
+    #[tokio::test]
+    async fn request_permission_returns_cancelled_on_overall_timeout() {
+        let gateway = StubPermissionGateway::new(Ok(()), vec![]);
+        let client = IronClawAcpClient::new(gateway, true)
+            .with_permission_timeout(Duration::from_millis(50));
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.request_permission(sample_request()),
+        )
+        .await
+        .expect("did not resolve within real timeout")
+        .expect("request_permission returned Err, expected Ok(Cancelled)");
+        assert!(matches!(
+            resp.outcome,
+            acp::RequestPermissionOutcome::Cancelled
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_permission_rejects_empty_options_when_surfacing() {
+        let gateway = StubPermissionGateway::new(Ok(()), vec![]);
+        let client = IronClawAcpClient::new(gateway, true);
+
+        let req = acp::RequestPermissionRequest::new(
+            acp::SessionId::new("test-session"),
+            acp::ToolCallUpdate::new("tc-1", acp::ToolCallUpdateFields::default()),
+            vec![], // no options
+        );
+        let err = client.request_permission(req).await.unwrap_err();
+        // `acp::Error::invalid_params()` — verify via debug repr.
+        assert!(format!("{err:?}").to_lowercase().contains("invalid"));
+    }
+
+    #[test]
+    fn permission_option_kind_maps_all_variants() {
+        assert_eq!(
+            permission_option_kind_to_dto(acp::PermissionOptionKind::AllowOnce),
+            PermissionOptionKindDto::AllowOnce
+        );
+        assert_eq!(
+            permission_option_kind_to_dto(acp::PermissionOptionKind::AllowAlways),
+            PermissionOptionKindDto::AllowAlways
+        );
+        assert_eq!(
+            permission_option_kind_to_dto(acp::PermissionOptionKind::RejectOnce),
+            PermissionOptionKindDto::RejectOnce
+        );
+        assert_eq!(
+            permission_option_kind_to_dto(acp::PermissionOptionKind::RejectAlways),
+            PermissionOptionKindDto::RejectAlways
+        );
+    }
+
+    #[test]
+    fn build_register_payload_captures_tool_fields() {
+        let req = sample_request();
+        let permission_id = Uuid::new_v4();
+        let payload = build_register_payload(permission_id, &req);
+
+        assert_eq!(payload.permission_id, permission_id);
+        assert_eq!(payload.tool_call_id, "tc-1");
+        assert_eq!(payload.tool_name, "shell");
+        assert_eq!(payload.tool_kind.as_deref(), Some("execute"));
+        assert_eq!(payload.options.len(), 2);
+        assert_eq!(payload.options[0].option_id, "allow-once");
+        assert_eq!(payload.options[0].kind, PermissionOptionKindDto::AllowOnce);
+        assert_eq!(payload.options[1].kind, PermissionOptionKindDto::RejectOnce);
+    }
+
+    #[test]
+    fn build_register_payload_falls_back_when_title_missing() {
+        let req = acp::RequestPermissionRequest::new(
+            acp::SessionId::new("s"),
+            acp::ToolCallUpdate::new("tc-1", acp::ToolCallUpdateFields::default()),
+            vec![acp::PermissionOption::new(
+                "a",
+                "A",
+                acp::PermissionOptionKind::AllowOnce,
+            )],
+        );
+        let payload = build_register_payload(Uuid::new_v4(), &req);
+        assert_eq!(payload.tool_name, "(unknown)");
+        assert!(payload.tool_kind.is_none());
+    }
+
+    // ==================== end request_permission tests ====================
 
     /// Regression test for #1981: repeated transient poll errors must eventually
     /// give up after MAX_CONSECUTIVE_POLL_ERRORS retries.

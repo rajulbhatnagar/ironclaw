@@ -1,6 +1,11 @@
 let currentJobId = null;
 let currentJobSubTab = 'overview';
 let jobFilesTreeState = null;
+// jobId -> array of PendingJobGateDto. Source of truth is the HTTP
+// `/api/jobs/pending-gates` response; SSE `gate_required` events are just
+// a refresh trigger.
+const pendingJobGates = new Map();
+let pendingGateRefreshTimer = null;
 
 function loadJobs() {
   currentJobId = null;
@@ -20,11 +25,52 @@ function loadJobs() {
   Promise.all([
     apiFetch('/api/jobs/summary'),
     apiFetch('/api/jobs'),
-  ]).then(([summary, jobList]) => {
+    apiFetch('/api/jobs/pending-gates').catch(() => ({ gates: [] })),
+  ]).then(([summary, jobList, pending]) => {
     activeWorkStore.rememberJobs(jobList.jobs);
+    updatePendingJobGates(pending.gates || []);
     renderJobsSummary(summary);
     renderJobsList(jobList.jobs);
   }).catch(() => {});
+}
+
+// Replace the pendingJobGates map from a fresh server response. Called on
+// tab-open and debounced after every SSE gate_required event.
+function updatePendingJobGates(gates) {
+  pendingJobGates.clear();
+  for (const gate of gates) {
+    const list = pendingJobGates.get(gate.job_id) || [];
+    list.push(gate);
+    pendingJobGates.set(gate.job_id, list);
+  }
+}
+
+// Fetch fresh state and re-render whatever is currently visible.
+function refreshPendingJobGates() {
+  return apiFetch('/api/jobs/pending-gates').then((res) => {
+    updatePendingJobGates(res.gates || []);
+    // If on the jobs list, re-render rows so badges update. If inside a
+    // job detail's Activity subtab, re-render the card list in place.
+    if (currentJobId == null) {
+      const tbody = document.getElementById('jobs-tbody');
+      if (tbody && tbody.dataset.jobsSnapshot) {
+        const jobs = JSON.parse(tbody.dataset.jobsSnapshot);
+        renderJobsList(jobs);
+      }
+    } else if (currentJobSubTab === 'activity') {
+      const host = document.getElementById('job-pending-gates');
+      if (host) renderJobPendingGates(host, currentJobId);
+    }
+  }).catch(() => {});
+}
+
+// Debounced variant for SSE bursts.
+function scheduleRefreshPendingJobGates() {
+  if (pendingGateRefreshTimer) return;
+  pendingGateRefreshTimer = setTimeout(() => {
+    pendingGateRefreshTimer = null;
+    refreshPendingJobGates();
+  }, 150);
 }
 
 function renderJobsSummary(s) {
@@ -47,6 +93,10 @@ function renderJobsList(jobs) {
   const tbody = document.getElementById('jobs-tbody');
   const empty = document.getElementById('jobs-empty');
 
+  // Cache the current jobs snapshot so refreshPendingJobGates() can re-render
+  // without a full network refresh when a gate event changes badge state.
+  tbody.dataset.jobsSnapshot = JSON.stringify(jobs);
+
   if (jobs.length === 0) {
     tbody.innerHTML = '';
     empty.style.display = 'block';
@@ -57,6 +107,9 @@ function renderJobsList(jobs) {
   tbody.innerHTML = jobs.map((job) => {
     const shortId = job.id.substring(0, 8);
     const stateClass = job.state.replace(' ', '_');
+    const pendingBadge = pendingJobGates.has(job.id)
+      ? '<span class="job-pending-badge" title="' + escapeHtml(I18n.t('jobs.pendingApproval') || 'Awaiting approval') + '"></span>'
+      : '';
 
     let actionBtns = '';
     if (job.state === 'pending' || job.state === 'in_progress') {
@@ -65,7 +118,7 @@ function renderJobsList(jobs) {
     // Retry is only shown in the detail view where can_restart is available.
 
     return '<tr class="job-row" data-action="open-job" data-id="' + escapeHtml(job.id) + '">'
-      + '<td title="' + escapeHtml(job.id) + '">' + shortId + '</td>'
+      + '<td title="' + escapeHtml(job.id) + '">' + shortId + pendingBadge + '</td>'
       + '<td>' + escapeHtml(job.title) + '</td>'
       + '<td><span class="badge ' + stateClass + '">' + escapeHtml(job.state) + '</span></td>'
       + '<td>' + formatDate(job.created_at) + '</td>'
@@ -377,11 +430,29 @@ let activityCurrentJobId = null;
 // only appends new ones (avoids duplicates on each SSE tick).
 let activityRenderedLiveIndex = 0;
 
+// Render the pending-approval cards for `jobId` into `host`. Re-entrant —
+// refetches from `pendingJobGates` and rebuilds; card dedup inside
+// `buildApprovalCard` keeps no-op re-renders cheap. Click handlers route
+// through `/api/chat/gate/resolve` via `sendApprovalAction` (identical to
+// chat approvals).
+function renderJobPendingGates(host, jobId) {
+  host.innerHTML = '';
+  const gates = pendingJobGates.get(jobId) || [];
+  if (gates.length === 0) return;
+  for (const gate of gates) {
+    buildApprovalCard(gate, {
+      parent: host,
+      onResolve: (action) => sendApprovalAction(gate.request_id, action, gate.thread_id),
+    });
+  }
+}
+
 function renderJobActivity(container, job) {
   activityCurrentJobId = job ? job.id : null;
   activityRenderedLiveIndex = 0;
 
-  let html = '<div class="activity-toolbar">'
+  let html = '<div id="job-pending-gates"></div>'
+    + '<div class="activity-toolbar">'
     + '<select id="activity-type-filter">'
     + '<option value="all">All Events</option>'
     + '<option value="message">Messages</option>'
@@ -401,6 +472,15 @@ function renderJobActivity(container, job) {
   }
 
   container.innerHTML = html;
+
+  // Populate pending-gates area from the cached map. On Activity tab open
+  // we also schedule a fresh fetch so late-arriving gates show up even if
+  // the initial `loadJobs` fetch ran before the gate was registered.
+  const gatesHost = document.getElementById('job-pending-gates');
+  if (gatesHost && job) {
+    renderJobPendingGates(gatesHost, job.id);
+    scheduleRefreshPendingJobGates();
+  }
 
   document.getElementById('activity-type-filter').addEventListener('change', applyActivityFilter);
 

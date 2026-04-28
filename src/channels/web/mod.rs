@@ -196,6 +196,7 @@ impl GatewayChannel {
             oauth_sweep_shutdown: None,
             frontend_html_cache: Arc::new(tokio::sync::RwLock::new(None)),
             tool_dispatcher: None,
+            acp_permissions: None,
         });
 
         Self {
@@ -262,6 +263,7 @@ impl GatewayChannel {
             // just because a `with_*` builder added a new subsystem.
             frontend_html_cache: Arc::clone(&self.state.frontend_html_cache),
             tool_dispatcher: self.state.tool_dispatcher.clone(),
+            acp_permissions: self.state.acp_permissions.clone(),
         };
         mutate(&mut new_state);
         new_state.auth_manager = build_gateway_auth_manager(&new_state);
@@ -325,6 +327,17 @@ impl GatewayChannel {
         dispatcher: Arc<crate::tools::dispatch::ToolDispatcher>,
     ) -> Self {
         self.rebuild_state(|s| s.tool_dispatcher = Some(dispatcher));
+        self
+    }
+
+    /// Inject the orchestrator's ACP permission store so
+    /// `/api/chat/gate/resolve` can wake the ACP bridge's long-poll on
+    /// `acp_permission` gates.
+    pub fn with_acp_permissions(
+        mut self,
+        store: Arc<crate::orchestrator::AcpPermissionStore>,
+    ) -> Self {
+        self.rebuild_state(|s| s.acp_permissions = Some(store));
         self
     }
 

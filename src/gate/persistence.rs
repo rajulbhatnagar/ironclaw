@@ -162,6 +162,7 @@ mod tests {
             resume_output: None,
             paused_lease: None,
             approval_already_granted: false,
+            job_id: None,
         }
     }
 

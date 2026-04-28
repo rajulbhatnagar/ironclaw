@@ -167,8 +167,9 @@ async fn test_agent(name: &str) -> anyhow::Result<()> {
     use agent_client_protocol::{self as acp, Agent as _};
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+    use crate::error::WorkerError;
     use crate::worker::acp_bridge;
-    use crate::worker::api::JobEventPayload;
+    use crate::worker::api::{JobEventPayload, PermissionDecision, PermissionRequestRegister};
 
     /// Event sink that prints agent output to stdout during `ironclaw acp test`.
     struct PrintEventSink;
@@ -188,6 +189,26 @@ async fn test_agent(name: &str) -> anyhow::Result<()> {
                 }
                 _ => {}
             }
+        }
+    }
+
+    // The CLI test command runs outside any orchestrator; no permission
+    // gateway is available, so we unconditionally auto-approve for test
+    // purposes (mirrors the legacy in-container behavior). The bridge
+    // runtime itself is what surfaces gates to real users.
+    impl acp_bridge::AcpPermissionGateway for PrintEventSink {
+        async fn register_permission(
+            &self,
+            _req: &PermissionRequestRegister,
+        ) -> Result<(), WorkerError> {
+            Ok(())
+        }
+
+        async fn poll_permission(
+            &self,
+            _permission_id: uuid::Uuid,
+        ) -> Result<Option<PermissionDecision>, WorkerError> {
+            Ok(None)
         }
     }
 
@@ -233,7 +254,11 @@ async fn test_agent(name: &str) -> anyhow::Result<()> {
             let outgoing = child_stdin.compat_write();
             let incoming = child_stdout.compat();
 
-            let client = acp_bridge::IronClawAcpClient::new(PrintEventSink);
+            // `surface_permissions = false`: no orchestrator in CLI test
+            // mode, so `request_permission` must fall back to legacy
+            // auto-approve. The gateway impl above returns `None` forever,
+            // which would hang if we set this to `true`.
+            let client = acp_bridge::IronClawAcpClient::new(PrintEventSink, false);
 
             let (conn, handle_io) =
                 acp::ClientSideConnection::new(client, outgoing, incoming, |fut| {

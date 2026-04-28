@@ -442,7 +442,14 @@ async fn async_main() -> anyhow::Result<()> {
     // sandbox worker communication.  Skip it entirely under --cli-only to
     // honour the "no network listeners" contract.
 
-    let (container_job_manager, job_event_tx, prompt_queue, docker_status) = if enable_non_cli {
+    let (
+        container_job_manager,
+        job_event_tx,
+        prompt_queue,
+        docker_status,
+        acp_permissions,
+        _orchestrator_shutdown,
+    ) = if enable_non_cli {
         let orch = ironclaw::orchestrator::setup_orchestrator(
             &config,
             &components.llm,
@@ -455,6 +462,8 @@ async fn async_main() -> anyhow::Result<()> {
             orch.job_event_tx,
             orch.prompt_queue,
             orch.docker_status,
+            orch.acp_permissions,
+            orch.shutdown,
         )
     } else {
         (
@@ -462,6 +471,8 @@ async fn async_main() -> anyhow::Result<()> {
             None,
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             ironclaw::sandbox::DockerStatus::Disabled,
+            None,
+            None,
         )
     };
 
@@ -863,6 +874,9 @@ async fn async_main() -> anyhow::Result<()> {
                 Arc::clone(db),
             ));
             gw = gw.with_tool_dispatcher(dispatcher);
+        }
+        if let Some(ref store) = acp_permissions {
+            gw = gw.with_acp_permissions(Arc::clone(store));
         }
         if let Some(ref ext_mgr) = components.extension_manager {
             // Enable gateway mode so MCP OAuth returns auth URLs to the frontend

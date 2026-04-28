@@ -16,14 +16,18 @@ use uuid::Uuid;
 
 use crate::channels::web::types::ToolDecisionDto;
 use crate::db::Database;
+use crate::gate::pending::PendingGate;
+use crate::gate::store::PendingGateStore;
 use crate::llm::{CompletionRequest, LlmProvider, ToolCompletionRequest};
+use crate::orchestrator::acp_permissions::AcpPermissionStore;
 use crate::orchestrator::auth::{TokenStore, worker_auth_middleware};
 use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::secrets::SecretsStore;
 use crate::worker::api::JobEventPayload;
 use crate::worker::api::{
-    CompletionReport, CredentialResponse, JobDescription, ProxyCompletionRequest,
-    ProxyCompletionResponse, ProxyToolCompletionRequest, ProxyToolCompletionResponse, StatusUpdate,
+    CompletionReport, CredentialResponse, JobDescription, PermissionRequestRegister,
+    ProxyCompletionRequest, ProxyCompletionResponse, ProxyToolCompletionRequest,
+    ProxyToolCompletionResponse, StatusUpdate,
 };
 use ironclaw_common::{AppEvent, JobResultStatus};
 
@@ -55,6 +59,13 @@ pub struct OrchestratorState {
     /// always the source of truth; the cache just avoids a round-trip on
     /// every job event for long-running jobs.
     pub job_owner_cache: Arc<std::sync::RwLock<HashMap<Uuid, String>>>,
+    /// Pending gate store shared with the web gateway. `None` in minimal
+    /// test setups; required for ACP permission prompt surfacing.
+    pub pending_gates: Option<Arc<PendingGateStore>>,
+    /// Per-ACP-permission correlation store. The bridge long-polls here
+    /// while the orchestrator waits for a user to resolve the matching
+    /// `PendingGate` via `/api/chat/gate/resolve`.
+    pub acp_permissions: Arc<AcpPermissionStore>,
 }
 
 /// Maximum entries in the job_owner_cache before arbitrary entries are
@@ -132,6 +143,14 @@ impl OrchestratorApi {
             .route("/worker/{job_id}/event", post(job_event_handler))
             .route("/worker/{job_id}/prompt", get(get_prompt_handler))
             .route("/worker/{job_id}/credentials", get(get_credentials_handler))
+            .route(
+                "/worker/{job_id}/permission",
+                post(register_permission_handler),
+            )
+            .route(
+                "/worker/{job_id}/permission/{permission_id}",
+                get(poll_permission_handler),
+            )
             .route_layer(axum::middleware::from_fn_with_state(
                 state.token_store.clone(),
                 worker_auth_middleware,
@@ -576,6 +595,192 @@ async fn get_credentials_handler(
     ))
 }
 
+// -- ACP permission handlers --
+
+/// Namespace for derived ACP thread IDs.
+///
+/// Gates in `PendingGateStore` are keyed by `(user_id, ThreadId)`. ACP jobs
+/// don't have an engine thread, so we derive a stable UUID from the job id
+/// using UUIDv5. Keeping the derivation function-local (not exported)
+/// prevents callers from relying on the scheme outside this module.
+const ACP_THREAD_NAMESPACE: Uuid = Uuid::from_u128(0x8a4f_1c42_e6b2_4b5a_9c6d_3f8e_11ac_deaf);
+
+/// How long a surfaced ACP permission request can sit unresolved. Should
+/// exceed the bridge's overall request_permission timeout so that the
+/// orchestrator's slot outlives the bridge's waiting call — if the bridge
+/// gave up, we don't want the user to still be clicking "approve" on a
+/// ghost.
+const ACP_PERMISSION_GATE_TTL: chrono::Duration = chrono::Duration::minutes(15);
+
+fn derive_acp_thread_id(job_id: Uuid) -> ironclaw_engine::ThreadId {
+    let derived = Uuid::new_v5(&ACP_THREAD_NAMESPACE, job_id.as_bytes());
+    ironclaw_engine::ThreadId(derived)
+}
+
+fn build_acp_pending_gate(
+    job_id: Uuid,
+    user_id: &str,
+    req: &PermissionRequestRegister,
+) -> PendingGate {
+    use crate::worker::api::PermissionOptionKindDto;
+
+    // ACP exposes allow-always per-option, not as a separate outcome. Pass
+    // `allow_always: true` to the engine's ResumeKind when the agent
+    // offered any AllowAlways option — that's the signal the UI uses to
+    // render the "always approve" button.
+    let allow_always = req
+        .options
+        .iter()
+        .any(|o| matches!(o.kind, PermissionOptionKindDto::AllowAlways));
+
+    let now = chrono::Utc::now();
+    PendingGate {
+        request_id: Uuid::new_v4(),
+        gate_name: crate::bridge::ACP_PERMISSION_GATE_NAME.to_string(),
+        user_id: user_id.to_string(),
+        thread_id: derive_acp_thread_id(job_id),
+        scope_thread_id: None,
+        conversation_id: ironclaw_engine::ConversationId::new(),
+        source_channel: "web".to_string(),
+        action_name: req.tool_name.clone(),
+        call_id: req.tool_call_id.clone(),
+        parameters: req.raw_input.clone().unwrap_or(serde_json::Value::Null),
+        display_parameters: None,
+        description: format!("ACP agent wants to run {}", req.tool_name),
+        resume_kind: ironclaw_engine::ResumeKind::Approval { allow_always },
+        created_at: now,
+        expires_at: now + ACP_PERMISSION_GATE_TTL,
+        original_message: None,
+        resume_output: None,
+        paused_lease: None,
+        approval_already_granted: false,
+        job_id: Some(job_id),
+    }
+}
+
+/// Register a permission request deferred by the ACP bridge.
+///
+/// Inserts a `PendingGate` for the user's web UI to render, broadcasts
+/// `AppEvent::GateRequired` so the SSE stream reflects the new gate, and
+/// parks a slot the bridge can long-poll until the user resolves the gate
+/// via `/api/chat/gate/resolve`.
+async fn register_permission_handler(
+    State(state): State<OrchestratorState>,
+    Path(job_id): Path<Uuid>,
+    Json(req): Json<PermissionRequestRegister>,
+) -> Result<StatusCode, StatusCode> {
+    // Prefer an explicitly-injected store (tests); otherwise look up the
+    // engine's canonical store lazily — engine init runs after orchestrator
+    // setup so we can't thread it through at construction time.
+    let pending_gates = match state.pending_gates.clone() {
+        Some(store) => store,
+        None => match crate::bridge::engine_pending_gate_store().await {
+            Some(store) => store,
+            None => {
+                tracing::error!(
+                    job_id = %job_id,
+                    "ACP permission surfaced but engine not initialized yet"
+                );
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+        },
+    };
+
+    // Resolve and validate the job owner up front. Fail closed: any job
+    // whose owner we can't identify cannot surface gates to a user.
+    let user_id = state.resolve_job_owner(job_id).await.ok_or_else(|| {
+        tracing::error!(
+            job_id = %job_id,
+            "Cannot resolve job owner for ACP permission; refusing"
+        );
+        StatusCode::FORBIDDEN
+    })?;
+    if user_id.is_empty() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let pending = build_acp_pending_gate(job_id, &user_id, &req);
+
+    // Register the slot **before** inserting the gate so a fast user
+    // resolution can't wake a slot that doesn't exist yet.
+    state
+        .acp_permissions
+        .register(
+            job_id,
+            req.permission_id,
+            pending.request_id,
+            req.options.clone(),
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                job_id = %job_id,
+                permission_id = %req.permission_id,
+                "ACP permission registration collided: {}. Bridge likely reused an id.", e,
+            );
+            StatusCode::CONFLICT
+        })?;
+
+    pending_gates.insert(pending.clone()).await.map_err(|e| {
+        tracing::warn!(
+            job_id = %job_id,
+            "Failed to insert ACP pending gate: {}", e
+        );
+        StatusCode::CONFLICT
+    })?;
+
+    if let Some(ref tx) = state.job_event_tx {
+        // projection-exempt: acp_permission, source log is the PendingGate
+        // insertion above; this orchestrator broadcast mirrors the bridge
+        // router's `notify_pending_gate` projection.
+        let _ = tx.send((
+            job_id,
+            user_id.clone(),
+            crate::bridge::pending_gate_to_app_event(&pending, None),
+        ));
+    }
+
+    Ok(StatusCode::ACCEPTED)
+}
+
+const ACP_PERMISSION_POLL_WINDOW: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// Long-poll for the user's decision on an ACP permission request.
+///
+/// Returns `200` with the decision when resolved, `204` if the poll window
+/// elapsed without a decision (bridge should retry), or `404` if the
+/// permission id is unknown (stale or expired).
+async fn poll_permission_handler(
+    State(state): State<OrchestratorState>,
+    Path((job_id, permission_id)): Path<(Uuid, Uuid)>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let Some(slot) = state.acp_permissions.get_slot(job_id, permission_id).await else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    let decision = tokio::select! {
+        d = slot.wait() => Some(d),
+        _ = tokio::time::sleep(ACP_PERMISSION_POLL_WINDOW) => None,
+    };
+
+    match decision {
+        Some(d) => {
+            let value = serde_json::to_value(&d).map_err(|e| {
+                tracing::error!(
+                    job_id = %job_id,
+                    permission_id = %permission_id,
+                    error = %e,
+                    "Failed to serialize PermissionDecision",
+                );
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            Ok((StatusCode::OK, Json(value)))
+        }
+        None => Ok((StatusCode::NO_CONTENT, Json(serde_json::Value::Null))),
+    }
+}
+
 fn format_finish_reason(reason: crate::llm::FinishReason) -> String {
     match reason {
         crate::llm::FinishReason::Stop => "stop".to_string(),
@@ -613,6 +818,8 @@ mod tests {
             store: None,
             secrets_store: None,
             job_owner_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            pending_gates: None,
+            acp_permissions: Arc::new(AcpPermissionStore::new()),
         }
     }
 
@@ -858,6 +1065,8 @@ mod tests {
             store: None,
             secrets_store: Some(secrets_store),
             job_owner_cache,
+            pending_gates: None,
+            acp_permissions: Arc::new(AcpPermissionStore::new()),
         };
 
         let router = OrchestratorApi::router(state);
@@ -924,6 +1133,8 @@ mod tests {
             store: None,
             secrets_store: Some(secrets_store),
             job_owner_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            pending_gates: None,
+            acp_permissions: Arc::new(AcpPermissionStore::new()),
         };
 
         let router = OrchestratorApi::router(state);
@@ -990,6 +1201,8 @@ mod tests {
             store: None,
             secrets_store: Some(secrets_store),
             job_owner_cache,
+            pending_gates: None,
+            acp_permissions: Arc::new(AcpPermissionStore::new()),
         };
 
         let router = OrchestratorApi::router(state);
@@ -1023,6 +1236,8 @@ mod tests {
             store: None,
             secrets_store: None,
             job_owner_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            pending_gates: None,
+            acp_permissions: Arc::new(AcpPermissionStore::new()),
         };
 
         let job_id = Uuid::new_v4();
@@ -1080,6 +1295,8 @@ mod tests {
             store: None,
             secrets_store: None,
             job_owner_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            pending_gates: None,
+            acp_permissions: Arc::new(AcpPermissionStore::new()),
         };
 
         let job_id = Uuid::new_v4();
@@ -1128,6 +1345,8 @@ mod tests {
             store: None,
             secrets_store: None,
             job_owner_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            pending_gates: None,
+            acp_permissions: Arc::new(AcpPermissionStore::new()),
         };
 
         let job_id = Uuid::new_v4();
@@ -1153,6 +1372,241 @@ mod tests {
         let (_recv_id, _recv_uid, event) = rx.recv().await.unwrap();
         // Unknown event types fall through to JobStatus
         assert!(matches!(event, AppEvent::JobStatus { .. }));
+    }
+
+    // -- ACP permission handler tests --
+
+    use crate::worker::api::{PermissionDecision, PermissionOptionDto, PermissionOptionKindDto};
+
+    fn sample_register_payload() -> PermissionRequestRegister {
+        PermissionRequestRegister {
+            permission_id: Uuid::new_v4(),
+            tool_call_id: "tc-1".to_string(),
+            tool_name: "shell".to_string(),
+            tool_kind: Some("execute".to_string()),
+            raw_input: Some(serde_json::json!({"cmd": "ls"})),
+            locations: vec![],
+            options: vec![
+                PermissionOptionDto {
+                    option_id: "allow-once".into(),
+                    name: "Allow once".into(),
+                    kind: PermissionOptionKindDto::AllowOnce,
+                },
+                PermissionOptionDto {
+                    option_id: "allow-always".into(),
+                    name: "Allow always".into(),
+                    kind: PermissionOptionKindDto::AllowAlways,
+                },
+                PermissionOptionDto {
+                    option_id: "reject".into(),
+                    name: "Reject".into(),
+                    kind: PermissionOptionKindDto::RejectOnce,
+                },
+            ],
+        }
+    }
+
+    fn state_with_acp_surface(user_id: &str, job_id: Uuid) -> OrchestratorState {
+        let token_store = TokenStore::new();
+        let jm = ContainerJobManager::new(ContainerJobConfig::default(), token_store.clone());
+        let (tx, _) = broadcast::channel(16);
+        let job_owner_cache = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        job_owner_cache
+            .write()
+            .unwrap()
+            .insert(job_id, user_id.to_string());
+        OrchestratorState {
+            llm: Arc::new(StubLlm::default()),
+            job_manager: Arc::new(jm),
+            token_store,
+            job_event_tx: Some(tx),
+            prompt_queue: Arc::new(Mutex::new(HashMap::new())),
+            store: None,
+            secrets_store: None,
+            job_owner_cache,
+            pending_gates: Some(Arc::new(PendingGateStore::in_memory())),
+            acp_permissions: Arc::new(AcpPermissionStore::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_permission_returns_503_when_gate_store_missing() {
+        // `register_permission_handler` falls back to the engine's global
+        // `PendingGateStore` when `state.pending_gates` is None. Acquire the
+        // shared test lock + clear engine state so a concurrent test can't
+        // leave a store installed and turn our 503 into a 202.
+        let _lock = crate::bridge::test_support::ENGINE_STATE_TEST_LOCK
+            .lock()
+            .await;
+        crate::bridge::test_support::clear_engine_state().await;
+
+        let job_id = Uuid::new_v4();
+        let state = {
+            let mut s = state_with_acp_surface("user-1", job_id);
+            s.pending_gates = None;
+            s
+        };
+        let token = state.token_store.create_token(job_id).await;
+        let router = OrchestratorApi::router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/worker/{}/permission", job_id))
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&sample_register_payload()).unwrap(),
+            ))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn register_permission_returns_403_when_owner_unknown() {
+        let token_store = TokenStore::new();
+        let jm = ContainerJobManager::new(ContainerJobConfig::default(), token_store.clone());
+        let (tx, _) = broadcast::channel(16);
+        let state = OrchestratorState {
+            llm: Arc::new(StubLlm::default()),
+            job_manager: Arc::new(jm),
+            token_store: token_store.clone(),
+            job_event_tx: Some(tx),
+            prompt_queue: Arc::new(Mutex::new(HashMap::new())),
+            store: None,
+            secrets_store: None,
+            // No owner cache entry → unknown owner → 403.
+            job_owner_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            pending_gates: Some(Arc::new(PendingGateStore::in_memory())),
+            acp_permissions: Arc::new(AcpPermissionStore::new()),
+        };
+        let job_id = Uuid::new_v4();
+        let token = token_store.create_token(job_id).await;
+        let router = OrchestratorApi::router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/worker/{}/permission", job_id))
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&sample_register_payload()).unwrap(),
+            ))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn register_permission_inserts_gate_and_broadcasts() {
+        let job_id = Uuid::new_v4();
+        let user_id = "user-1";
+        let state = state_with_acp_surface(user_id, job_id);
+        let mut rx = state.job_event_tx.as_ref().unwrap().subscribe();
+        let pending_gates = Arc::clone(state.pending_gates.as_ref().unwrap());
+        let acp_permissions = Arc::clone(&state.acp_permissions);
+        let token = state.token_store.create_token(job_id).await;
+        let payload = sample_register_payload();
+        let router = OrchestratorApi::router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/worker/{}/permission", job_id))
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // PendingGate was inserted.
+        let gates = pending_gates.list_for_user(user_id).await;
+        assert_eq!(gates.len(), 1);
+        assert_eq!(gates[0].gate_name, crate::bridge::ACP_PERMISSION_GATE_NAME);
+        assert_eq!(gates[0].action_name, "shell");
+        // allow_always must propagate because AllowAlways option was present.
+        match &gates[0].resume_kind {
+            ironclaw_engine::ResumeKind::Approval { allow_always } => {
+                assert!(*allow_always);
+            }
+            other => panic!("expected Approval ResumeKind, got {other:?}"),
+        }
+
+        // Broadcast fired.
+        let (recv_id, recv_uid, ev) = rx.recv().await.unwrap();
+        assert_eq!(recv_id, job_id);
+        assert_eq!(recv_uid, user_id);
+        assert!(matches!(ev, AppEvent::GateRequired { .. }));
+
+        // Slot registered for bridge polling.
+        let opts = acp_permissions
+            .options_for_request_id(gates[0].request_id)
+            .await
+            .unwrap();
+        assert_eq!(opts.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn poll_permission_returns_404_for_unknown_id() {
+        let job_id = Uuid::new_v4();
+        let state = state_with_acp_surface("user-1", job_id);
+        let token = state.token_store.create_token(job_id).await;
+        let router = OrchestratorApi::router(state);
+
+        let req = Request::builder()
+            .uri(format!("/worker/{}/permission/{}", job_id, Uuid::new_v4()))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn poll_permission_returns_decision_when_completed() {
+        let job_id = Uuid::new_v4();
+        let state = state_with_acp_surface("user-1", job_id);
+        let token = state.token_store.create_token(job_id).await;
+
+        // Pre-register + complete a slot so the handler returns immediately.
+        let permission_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        state
+            .acp_permissions
+            .register(
+                job_id,
+                permission_id,
+                request_id,
+                vec![],
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect("register");
+        assert!(
+            state
+                .acp_permissions
+                .complete_by_request_id(
+                    request_id,
+                    PermissionDecision::Selected {
+                        option_id: "allow-once".to_string(),
+                    },
+                )
+                .await
+        );
+
+        let router = OrchestratorApi::router(state);
+        let req = Request::builder()
+            .uri(format!("/worker/{}/permission/{}", job_id, permission_id))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["outcome"], "selected");
+        assert_eq!(json["option_id"], "allow-once");
     }
 
     // -- Status update test --

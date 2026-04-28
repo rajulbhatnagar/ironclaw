@@ -148,6 +148,21 @@ TOOL_CALL_PATTERNS = [
         },
     ),
     (
+        # E2E: spawn an ACP sandbox job. The orchestrator will start a
+        # container whose ACP agent is `test-acp-agent`, which always calls
+        # `session/request_permission` on each prompt, producing a
+        # PendingGate the Jobs tab should render.
+        re.compile(r"run test acp job", re.IGNORECASE),
+        "create_job",
+        lambda _: {
+            "title": "test-acp-job",
+            "description": "Trigger the test ACP agent's request_permission flow",
+            "mode": "acp",
+            "agent_name": "test-agent",
+            "wait": False,
+        },
+    ),
+    (
         re.compile(r"check gmail unread|gmail unread", re.IGNORECASE),
         "gmail",
         lambda _: {

@@ -938,6 +938,85 @@ pub async fn job_files_read_handler(
     }))
 }
 
+/// List every pending gate attached to a job for the authenticated user.
+///
+/// The Jobs UI polls this on tab-open and on each `gate_required` SSE
+/// event. Gates are produced by job workers (today: ACP containers, via
+/// `build_acp_pending_gate`) and tagged with `PendingGate::job_id` so a
+/// single store query covers every surface regardless of gate subtype.
+///
+/// Ownership is verified per entry — a gate whose `job_id` the caller
+/// does not own is silently skipped. The endpoint returns 200 with an
+/// empty list rather than 404 when the user has no pending gates.
+pub async fn jobs_pending_gates_handler(
+    State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<Json<PendingJobGatesResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let Some(gate_store) = crate::bridge::engine_pending_gate_store().await else {
+        return Ok(Json(PendingJobGatesResponse { gates: Vec::new() }));
+    };
+
+    let raw = gate_store.list_for_user(&user.user_id).await;
+    let mut out: Vec<PendingJobGateDto> = Vec::with_capacity(raw.len());
+
+    for gate in raw {
+        let Some(job_id) = gate.job_id else {
+            continue;
+        };
+        // Gates ship with the user's id already (see PendingGateStore::list_for_user),
+        // but ownership on the *job* row is a second axis. Confirm the user owns the
+        // job before exposing the gate.
+        let owned = match store.get_sandbox_job(job_id).await {
+            Ok(Some(job)) => job.is_owned_by(&user.user_id),
+            Ok(None) => match store.get_job(job_id).await {
+                Ok(Some(ctx)) => ctx.is_owned_by(&user.user_id),
+                _ => false,
+            },
+            Err(e) => {
+                tracing::warn!(
+                    %job_id,
+                    error = %e,
+                    "pending-gates: failed to look up job for ownership; skipping gate"
+                );
+                continue;
+            }
+        };
+        if !owned {
+            continue;
+        }
+
+        let allow_always = matches!(
+            gate.resume_kind,
+            ironclaw_engine::ResumeKind::Approval {
+                allow_always: true,
+                ..
+            }
+        );
+        let parameters = serde_json::to_string_pretty(
+            gate.display_parameters.as_ref().unwrap_or(&gate.parameters),
+        )
+        .unwrap_or_default();
+
+        out.push(PendingJobGateDto {
+            job_id,
+            request_id: gate.request_id.to_string(),
+            thread_id: gate.effective_wire_thread_id(),
+            gate_name: gate.gate_name.clone(),
+            tool_name: gate.action_name.clone(),
+            description: gate.description.clone(),
+            parameters,
+            resume_kind: gate.resume_kind.clone(),
+            allow_always,
+        });
+    }
+
+    Ok(Json(PendingJobGatesResponse { gates: out }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7670,6 +7670,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "test_acp_agent"
+version = "0.0.0"
+dependencies = [
+ "agent-client-protocol",
+ "async-trait",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "testcontainers"
 version = "0.23.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -428,6 +428,12 @@ function connectSSE(lastEventIdOverride) {
       });
     }
     handleGateRequired(data);
+    // A gate may belong to a job (ACP container, future bridge). The gate
+    // payload itself is type-agnostic here — let the Jobs surface refetch
+    // `/api/jobs/pending-gates` and update badges / Activity-tab cards.
+    if (typeof scheduleRefreshPendingJobGates === 'function') {
+      scheduleRefreshPendingJobGates();
+    }
   });
 
   addTrackedEventListener('gate_resolved', (e) => {
@@ -439,6 +445,9 @@ function connectSSE(lastEventIdOverride) {
       });
     }
     handleGateResolved(data);
+    if (typeof scheduleRefreshPendingJobGates === 'function') {
+      scheduleRefreshPendingJobGates();
+    }
   });
 
   addTrackedEventListener('extension_status', (e) => {

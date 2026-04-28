@@ -778,6 +778,28 @@
   100% { transform: translateY(-50%) scale(1.8); opacity: 0; }
 }
 
+/* Pending-gate surface on the Jobs tab. Reuses .approval-card classes
+   defined in chat.css — only the outer container and the list-row badge
+   are new. */
+#job-pending-gates {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+#job-pending-gates:empty {
+  display: none;
+}
+.job-pending-badge {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-left: var(--space-1);
+  border-radius: 50%;
+  background: var(--warning);
+  vertical-align: middle;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;

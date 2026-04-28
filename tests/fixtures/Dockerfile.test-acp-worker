@@ -1,0 +1,31 @@
+# Test worker image for ACP e2e scenarios.
+#
+# Builds on top of ironclaw-worker:latest and bakes in the
+# `test_acp_agent` binary, which always calls `session/request_permission`
+# on each prompt so the host can surface an approval gate to the Jobs tab.
+#
+# Build (from repo root):
+#
+#   # 1) The base worker image must exist locally
+#   docker build -f Dockerfile.worker -t ironclaw-worker:latest .
+#
+#   # 2) Build the test agent binary and stage it next to this Dockerfile
+#   #    (root-level target/ is excluded by .dockerignore; staging the
+#   #    binary under tests/fixtures/test_acp_agent/ keeps it in the
+#   #    build context without touching the main-build ignore list.)
+#   cargo build -p test_acp_agent --release
+#   cp target/release/test_acp_agent \
+#       tests/fixtures/test_acp_agent/test_acp_agent.bin
+#
+#   # 3) Build this image
+#   docker build -f tests/fixtures/Dockerfile.test-acp-worker \
+#       -t ironclaw-test-acp:latest .
+#
+# Then point the e2e ironclaw server at it via SANDBOX_IMAGE=ironclaw-test-acp:latest.
+
+FROM ironclaw-worker:latest
+
+# Binary staged next to this Dockerfile by the build script above. Baked
+# into the image rather than bind-mounted so production code has no
+# test-only env var branching.
+COPY tests/fixtures/test_acp_agent/test_acp_agent.bin /usr/local/bin/test-acp-agent

@@ -238,6 +238,17 @@ pub(crate) async fn chat_gate_resolve_handler(
     AuthenticatedUser(user): AuthenticatedUser,
     Json(req): Json<GateResolveRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    // ACP short-circuit: an ACP bridge deferred a `request_permission` RPC
+    // and parked a gate keyed by (user_id, derived_thread_id). The engine
+    // has no thread to resume — we just consume the gate and wake the
+    // bridge's long-poller with a typed `PermissionDecision`. This branch
+    // is cheap (one peek) for non-ACP traffic.
+    if let Some(thread_id) = req.thread_id.as_deref()
+        && let Some(resp) = try_resolve_acp_permission(&state, &user, &req, thread_id).await?
+    {
+        return Ok(resp);
+    }
+
     match req.resolution {
         GateResolutionPayload::Approved { always } => {
             let action = if always { "always" } else { "approve" }.to_string();
@@ -318,6 +329,157 @@ pub(crate) async fn chat_gate_resolve_handler(
             )
             .await?;
             Ok(Json(ActionResponse::ok("Gate cancelled.")))
+        }
+    }
+}
+
+/// Attempt to resolve a pending gate as an ACP permission decision.
+///
+/// Returns `Ok(Some(_))` when the gate with this `request_id` was an
+/// `acp_permission` gate and the decision was forwarded to the bridge.
+/// Returns `Ok(None)` when the gate was a different kind (engine v2 auth,
+/// approval, etc.) — the caller should fall through to the normal
+/// resolution path.
+async fn try_resolve_acp_permission(
+    state: &Arc<GatewayState>,
+    user: &crate::channels::web::auth::UserIdentity,
+    req: &GateResolveRequest,
+    thread_id: &str,
+) -> Result<Option<Json<ActionResponse>>, (StatusCode, String)> {
+    let request_id = Uuid::parse_str(&req.request_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid request_id (expected UUID)".to_string(),
+        )
+    })?;
+
+    let Some(acp_permissions) = state.acp_permissions.as_ref() else {
+        // No orchestrator wired — fall through; if there's no gate at all
+        // for this request_id, the normal approval path will 404 cleanly.
+        // If an ACP gate does exist, the options lookup below would return
+        // None anyway (same backing store missing).
+        return Ok(None);
+    };
+
+    // Options lookup doubles as "is this an ACP permission request?" test.
+    // Registration inserts options before the gate, so if options exist,
+    // the gate exists too. If options are missing, either this isn't an
+    // ACP gate (fall through) or the slot already resolved/expired —
+    // attempting to take the gate below disambiguates.
+    let options = match acp_permissions.options_for_request_id(request_id).await {
+        Some(opts) => opts,
+        None => return Ok(None),
+    };
+
+    // Atomically consume the gate. Returns Ok(None) if the gate isn't
+    // acp_permission-typed, in which case we fall through; Err on a real
+    // store error (expired, etc.).
+    let taken =
+        crate::bridge::take_verified_acp_permission_gate(&user.user_id, thread_id, request_id)
+            .await
+            .map_err(|e| {
+                let msg = match &e {
+                    crate::gate::store::GateStoreError::NotFound => {
+                        "ACP permission gate not found".to_string()
+                    }
+                    crate::gate::store::GateStoreError::Expired => {
+                        "ACP permission gate expired".to_string()
+                    }
+                    _ => format!("Gate resolution failed: {e}"),
+                };
+                (StatusCode::GONE, msg)
+            })?;
+    if taken.is_none() {
+        return Ok(None);
+    }
+
+    let decision = map_gate_resolution_to_acp_decision(&req.resolution, &options)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    if !acp_permissions
+        .complete_by_request_id(request_id, decision)
+        .await
+    {
+        return Err((
+            StatusCode::GONE,
+            "ACP permission already resolved".to_string(),
+        ));
+    }
+
+    Ok(Some(Json(ActionResponse::ok("ACP permission resolved."))))
+}
+
+/// Map the user's `GateResolutionPayload` onto one of the options the ACP
+/// agent offered.
+///
+/// # Permanence rule
+///
+/// The mapper **never upgrades permanence**. Downgrading (`Always` →
+/// `Once`) is acceptable — the worst case is that the agent re-prompts
+/// next time. Upgrading (`Once` → `Always`) is not — that would persist
+/// a decision across the session that the user never clicked for. When
+/// the only option available would upgrade permanence, the mapper
+/// returns `Cancelled` so no persistent decision is written; the agent
+/// may resurface the prompt and the user can resolve it then.
+///
+/// This pairs with the UI rendering buttons based on the gate's
+/// `ResumeKind::Approval { allow_always }` flag (set in
+/// `build_acp_pending_gate`), which already hides the "always" button
+/// when the agent didn't offer `AllowAlways`. The permanence rule here
+/// is defense-in-depth for clients that don't honour that flag.
+fn map_gate_resolution_to_acp_decision(
+    payload: &GateResolutionPayload,
+    options: &[crate::worker::api::PermissionOptionDto],
+) -> Result<crate::worker::api::PermissionDecision, String> {
+    use crate::worker::api::{PermissionDecision, PermissionOptionKindDto};
+
+    let find_kind = |kind: PermissionOptionKindDto| -> Option<String> {
+        options
+            .iter()
+            .find(|o| o.kind == kind)
+            .map(|o| o.option_id.clone())
+    };
+
+    match payload {
+        GateResolutionPayload::Approved { always: true } => {
+            // Prefer AllowAlways; downgrading to AllowOnce is safe (the
+            // agent re-prompts next time instead of remembering).
+            let option_id = find_kind(PermissionOptionKindDto::AllowAlways)
+                .or_else(|| find_kind(PermissionOptionKindDto::AllowOnce))
+                .ok_or_else(|| {
+                    "ACP agent offered no allow option for this permission request".to_string()
+                })?;
+            Ok(PermissionDecision::Selected { option_id })
+        }
+        GateResolutionPayload::Approved { always: false } => {
+            // User asked for one-time approval. Upgrading to AllowAlways
+            // would persist a decision they didn't consent to — refuse
+            // and let the agent re-prompt instead.
+            if let Some(option_id) = find_kind(PermissionOptionKindDto::AllowOnce) {
+                return Ok(PermissionDecision::Selected { option_id });
+            }
+            if options
+                .iter()
+                .any(|o| o.kind == PermissionOptionKindDto::AllowAlways)
+            {
+                return Ok(PermissionDecision::Cancelled);
+            }
+            Err("ACP agent offered no allow option for this permission request".to_string())
+        }
+        GateResolutionPayload::Denied => {
+            // Same permanence rule on the reject side: prefer RejectOnce,
+            // refuse to upgrade to RejectAlways (would persist a "never
+            // allow this" decision the user didn't ask for). Falls back
+            // to Cancelled when neither is available — the only safe
+            // wire signal left.
+            if let Some(option_id) = find_kind(PermissionOptionKindDto::RejectOnce) {
+                return Ok(PermissionDecision::Selected { option_id });
+            }
+            Ok(PermissionDecision::Cancelled)
+        }
+        GateResolutionPayload::Cancelled => Ok(PermissionDecision::Cancelled),
+        GateResolutionPayload::CredentialProvided { .. } => {
+            Err("credential resolution is not applicable to ACP permission gates".to_string())
         }
     }
 }
@@ -1254,6 +1416,167 @@ mod tests {
         routing::{get, post},
     };
     use uuid::Uuid;
+
+    // ──────────────────────────────────────────────────────────────────
+    // ACP permission resolution mapping tests
+    // ──────────────────────────────────────────────────────────────────
+    mod acp_permission_mapping {
+        use super::super::map_gate_resolution_to_acp_decision;
+        use crate::channels::web::types::GateResolutionPayload;
+        use crate::worker::api::{
+            PermissionDecision, PermissionOptionDto, PermissionOptionKindDto,
+        };
+
+        fn opt(id: &str, kind: PermissionOptionKindDto) -> PermissionOptionDto {
+            PermissionOptionDto {
+                option_id: id.to_string(),
+                name: id.to_string(),
+                kind,
+            }
+        }
+
+        #[test]
+        fn approved_once_picks_allow_once_when_present() {
+            let options = vec![
+                opt("allow-once", PermissionOptionKindDto::AllowOnce),
+                opt("allow-always", PermissionOptionKindDto::AllowAlways),
+                opt("reject", PermissionOptionKindDto::RejectOnce),
+            ];
+            let d = map_gate_resolution_to_acp_decision(
+                &GateResolutionPayload::Approved { always: false },
+                &options,
+            )
+            .unwrap();
+            assert_eq!(
+                d,
+                PermissionDecision::Selected {
+                    option_id: "allow-once".into()
+                }
+            );
+        }
+
+        #[test]
+        fn approved_always_picks_allow_always_when_present() {
+            let options = vec![
+                opt("allow-once", PermissionOptionKindDto::AllowOnce),
+                opt("allow-always", PermissionOptionKindDto::AllowAlways),
+            ];
+            let d = map_gate_resolution_to_acp_decision(
+                &GateResolutionPayload::Approved { always: true },
+                &options,
+            )
+            .unwrap();
+            assert_eq!(
+                d,
+                PermissionDecision::Selected {
+                    option_id: "allow-always".into()
+                }
+            );
+        }
+
+        #[test]
+        fn approved_always_falls_back_to_allow_once_when_always_missing() {
+            // Downgrade: user asked for "remember", gets "this time only".
+            // Safe because agent re-prompts next time rather than persisting
+            // a decision the user didn't consent to.
+            let options = vec![opt("allow-once", PermissionOptionKindDto::AllowOnce)];
+            let d = map_gate_resolution_to_acp_decision(
+                &GateResolutionPayload::Approved { always: true },
+                &options,
+            )
+            .unwrap();
+            assert_eq!(
+                d,
+                PermissionDecision::Selected {
+                    option_id: "allow-once".into()
+                }
+            );
+        }
+
+        #[test]
+        fn approved_once_refuses_to_upgrade_to_allow_always() {
+            // User asked "this time only"; only AllowAlways is available.
+            // Upgrading would persist a decision the user didn't click for.
+            // Cancel instead so the agent re-prompts.
+            let options = vec![opt("allow-always", PermissionOptionKindDto::AllowAlways)];
+            let d = map_gate_resolution_to_acp_decision(
+                &GateResolutionPayload::Approved { always: false },
+                &options,
+            )
+            .unwrap();
+            assert_eq!(d, PermissionDecision::Cancelled);
+        }
+
+        #[test]
+        fn approved_errors_when_no_allow_option_offered() {
+            let options = vec![opt("reject", PermissionOptionKindDto::RejectOnce)];
+            let err = map_gate_resolution_to_acp_decision(
+                &GateResolutionPayload::Approved { always: false },
+                &options,
+            )
+            .unwrap_err();
+            assert!(err.to_lowercase().contains("allow"));
+        }
+
+        #[test]
+        fn denied_picks_reject_once_when_present() {
+            let options = vec![
+                opt("allow-once", PermissionOptionKindDto::AllowOnce),
+                opt("reject-once", PermissionOptionKindDto::RejectOnce),
+                opt("reject-always", PermissionOptionKindDto::RejectAlways),
+            ];
+            let d = map_gate_resolution_to_acp_decision(&GateResolutionPayload::Denied, &options)
+                .unwrap();
+            assert_eq!(
+                d,
+                PermissionDecision::Selected {
+                    option_id: "reject-once".into()
+                }
+            );
+        }
+
+        #[test]
+        fn denied_refuses_to_upgrade_to_reject_always() {
+            // Same permanence rule on the reject side: user clicked "deny
+            // once"; only RejectAlways is offered. Upgrading would persist
+            // a "never allow" decision the user didn't ask for. Cancel
+            // instead.
+            let options = vec![opt("reject-always", PermissionOptionKindDto::RejectAlways)];
+            let d = map_gate_resolution_to_acp_decision(&GateResolutionPayload::Denied, &options)
+                .unwrap();
+            assert_eq!(d, PermissionDecision::Cancelled);
+        }
+
+        #[test]
+        fn denied_falls_back_to_cancelled_when_no_reject_option() {
+            let options = vec![opt("allow-once", PermissionOptionKindDto::AllowOnce)];
+            let d = map_gate_resolution_to_acp_decision(&GateResolutionPayload::Denied, &options)
+                .unwrap();
+            assert_eq!(d, PermissionDecision::Cancelled);
+        }
+
+        #[test]
+        fn cancelled_maps_to_cancelled() {
+            let options = vec![opt("allow-once", PermissionOptionKindDto::AllowOnce)];
+            let d =
+                map_gate_resolution_to_acp_decision(&GateResolutionPayload::Cancelled, &options)
+                    .unwrap();
+            assert_eq!(d, PermissionDecision::Cancelled);
+        }
+
+        #[test]
+        fn credential_provided_returns_error() {
+            let options = vec![opt("allow-once", PermissionOptionKindDto::AllowOnce)];
+            let err = map_gate_resolution_to_acp_decision(
+                &GateResolutionPayload::CredentialProvided {
+                    token: "tok".into(),
+                },
+                &options,
+            )
+            .unwrap_err();
+            assert!(err.to_lowercase().contains("credential"));
+        }
+    }
 
     use crate::agent::SessionManager;
 
@@ -2981,6 +3304,130 @@ mod tests {
             incoming.metadata.get("thread_id").and_then(|v| v.as_str()),
             Some("gateway-thread-auth")
         );
+    }
+
+    #[tokio::test]
+    async fn test_chat_gate_resolve_handler_acp_permission_wakes_bridge_waiter() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let _lock = crate::bridge::test_support::ENGINE_STATE_TEST_LOCK
+            .lock()
+            .await;
+        crate::bridge::test_support::clear_engine_state().await;
+        crate::bridge::test_support::install_engine_state_with_threads(Vec::new()).await;
+
+        let gate_store = crate::bridge::engine_pending_gate_store()
+            .await
+            .expect("engine gate store installed");
+
+        let thread_id = ironclaw_engine::ThreadId::new();
+        let request_id = Uuid::new_v4();
+        let user_id = "member-1";
+        let job_id = Uuid::new_v4();
+
+        let pending = crate::gate::pending::PendingGate {
+            request_id,
+            gate_name: crate::bridge::ACP_PERMISSION_GATE_NAME.to_string(),
+            user_id: user_id.to_string(),
+            thread_id,
+            scope_thread_id: None,
+            conversation_id: ironclaw_engine::ConversationId::new(),
+            source_channel: "web".to_string(),
+            action_name: "shell".to_string(),
+            call_id: "tc-1".to_string(),
+            parameters: serde_json::Value::Null,
+            display_parameters: None,
+            description: "ACP agent wants to run shell".to_string(),
+            resume_kind: ironclaw_engine::ResumeKind::Approval {
+                allow_always: false,
+            },
+            created_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(15),
+            original_message: None,
+            resume_output: None,
+            paused_lease: None,
+            approval_already_granted: false,
+            job_id: Some(job_id),
+        };
+        gate_store.insert(pending).await.expect("insert gate");
+
+        let acp_store = Arc::new(crate::orchestrator::AcpPermissionStore::new());
+        let permission_id = Uuid::new_v4();
+        let option = crate::worker::api::PermissionOptionDto {
+            option_id: "allow-once".to_string(),
+            name: "Allow once".to_string(),
+            kind: crate::worker::api::PermissionOptionKindDto::AllowOnce,
+        };
+        acp_store
+            .register(
+                job_id,
+                permission_id,
+                request_id,
+                vec![option],
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect("register slot");
+
+        let mut state = test_gateway_state(None);
+        {
+            let state_mut = Arc::get_mut(&mut state).expect("test state uniquely owned");
+            state_mut.acp_permissions = Some(Arc::clone(&acp_store));
+        }
+
+        let app = Router::new()
+            .route("/api/chat/gate/resolve", post(chat_gate_resolve_handler))
+            .with_state(state);
+
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/chat/gate/resolve")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "request_id": request_id,
+                    "thread_id": thread_id.0.to_string(),
+                    "resolution": "approved",
+                    "always": false,
+                })
+                .to_string(),
+            ))
+            .expect("request");
+        req.extensions_mut().insert(UserIdentity {
+            user_id: user_id.to_string(),
+            role: "member".to_string(),
+            workspace_read_scopes: Vec::new(),
+        });
+
+        let resp = ServiceExt::<axum::http::Request<Body>>::oneshot(app, req)
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Verify the bridge-side waiter observes the decision.
+        let slot = acp_store
+            .get_slot(job_id, permission_id)
+            .await
+            .expect("slot present after resolve");
+        let decision = tokio::time::timeout(std::time::Duration::from_millis(500), slot.wait())
+            .await
+            .expect("waiter resolved promptly");
+        assert_eq!(
+            decision,
+            crate::worker::api::PermissionDecision::Selected {
+                option_id: "allow-once".to_string()
+            }
+        );
+
+        // And the gate is consumed from the engine store.
+        let remaining = gate_store.list_for_user(user_id).await;
+        assert!(
+            remaining.is_empty(),
+            "ACP permission gate must be removed after resolution",
+        );
+
+        crate::bridge::test_support::clear_engine_state().await;
     }
 
     #[tokio::test]

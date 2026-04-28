@@ -36,6 +36,17 @@ pub struct AcpAgentConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
+    /// Whether ACP `request_permission` calls from this agent should be
+    /// surfaced to the user (via the web UI's gate card) instead of being
+    /// auto-approved in the container.
+    ///
+    /// Default: `false` — preserves legacy auto-approve behavior (the
+    /// Docker sandbox is the boundary). Opt in per agent when you want a
+    /// second, user-consent layer. The host passes this through to the
+    /// spawned container as `IRONCLAW_ACP_SURFACE_PERMISSIONS`.
+    #[serde(default)]
+    pub surface_permissions: bool,
+
     /// Optional description for the agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -59,6 +70,7 @@ impl AcpAgentConfig {
             args,
             env,
             enabled: true,
+            surface_permissions: false,
             description: None,
         }
     }
@@ -511,6 +523,26 @@ mod tests {
         let enabled: Vec<_> = file.enabled_agents().collect();
         assert_eq!(enabled.len(), 1);
         assert_eq!(enabled[0].name, "goose");
+    }
+
+    #[test]
+    fn surface_permissions_defaults_to_false_when_missing_from_json() {
+        // Legacy rows stored before the field existed must deserialize with
+        // surface_permissions=false (auto-approve, matches current
+        // behavior).
+        let json = r#"{"name":"goose","command":"goose","args":[]}"#;
+        let agent: AcpAgentConfig = serde_json::from_str(json).unwrap();
+        assert!(!agent.surface_permissions);
+    }
+
+    #[test]
+    fn surface_permissions_round_trips() {
+        let mut agent =
+            AcpAgentConfig::new("goose", "goose", vec!["--stdio".into()], HashMap::new());
+        agent.surface_permissions = true;
+        let json = serde_json::to_string(&agent).unwrap();
+        let parsed: AcpAgentConfig = serde_json::from_str(&json).unwrap();
+        assert!(parsed.surface_permissions);
     }
 
     #[test]

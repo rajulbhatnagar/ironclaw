@@ -695,24 +695,38 @@ async fn notify_pending_gate(
     // buttons). No text response is returned to avoid a duplicate message
     // alongside the card.
     if let Some(ref sse) = sse {
-        let display_parameters = gate_display_parameters(pending);
         sse.broadcast_for_user(
             &message.user_id,
-            AppEvent::GateRequired {
-                request_id: pending.request_id.to_string(),
-                gate_name: pending.gate_name.clone(),
-                tool_name: pending.action_name.clone(),
-                description: pending.description.clone(),
-                parameters: serde_json::to_string_pretty(&display_parameters)
-                    .unwrap_or_else(|_| display_parameters.to_string()),
-                extension_name: extension_name.clone(),
-                resume_kind: serde_json::to_value(&pending.resume_kind).unwrap_or_default(),
-                thread_id: Some(pending.effective_wire_thread_id()),
-            },
+            pending_gate_to_app_event(pending, extension_name.clone()),
         );
     }
     send_pending_gate_status(agent, message, pending, extension_name.as_ref()).await;
     Ok(BridgeOutcome::Pending)
+}
+
+/// Project a `PendingGate` into the `AppEvent::GateRequired` SSE variant.
+///
+/// The `PendingGate` stored in `PendingGateStore` is the typed source log;
+/// this function is the sole projection used by all producers (engine v2
+/// bridge dispatcher and the orchestrator's ACP permission handler).
+/// Callers are responsible for deciding *whether* to broadcast; this
+/// function just builds the payload.
+pub(crate) fn pending_gate_to_app_event(
+    pending: &PendingGate,
+    extension_name: Option<ironclaw_common::ExtensionName>,
+) -> AppEvent {
+    let display_parameters = gate_display_parameters(pending);
+    AppEvent::GateRequired {
+        request_id: pending.request_id.to_string(),
+        gate_name: pending.gate_name.clone(),
+        tool_name: pending.action_name.clone(),
+        description: pending.description.clone(),
+        parameters: serde_json::to_string_pretty(&display_parameters)
+            .unwrap_or_else(|_| display_parameters.to_string()),
+        extension_name,
+        resume_kind: serde_json::to_value(&pending.resume_kind).unwrap_or_default(),
+        thread_id: Some(pending.effective_wire_thread_id()),
+    }
 }
 
 async fn insert_and_notify_pending_gate(
@@ -788,6 +802,7 @@ async fn requeue_auth_pending_gate(
         resume_output: pending.resume_output.clone(),
         paused_lease: pending.paused_lease.clone(),
         approval_already_granted: pending.approval_already_granted,
+        job_id: pending.job_id,
     };
 
     insert_and_notify_pending_gate(agent, state, message, next_pending).await
@@ -816,6 +831,7 @@ fn pairing_pending_gate_from_auth(pending: &PendingGate, extension_name: &str) -
         resume_output: pending.resume_output.clone(),
         paused_lease: pending.paused_lease.clone(),
         approval_already_granted: pending.approval_already_granted,
+        job_id: pending.job_id,
     }
 }
 
@@ -1173,6 +1189,7 @@ async fn execute_pending_gate_action(
                         pending.resume_kind,
                         ironclaw_engine::ResumeKind::Approval { .. }
                     ),
+                job_id: pending.job_id,
             };
             insert_and_notify_pending_gate(agent, state, message, pending_gate).await
         }
@@ -2065,6 +2082,81 @@ pub async fn get_engine_pending_gate(
         )),
         PendingGateResolution::None | PendingGateResolution::Ambiguous => Ok(None),
     }
+}
+
+/// Gate name used for ACP-originated permission prompts. When
+/// `chat_gate_resolve_handler` sees a gate with this name it bypasses the
+/// engine v2 resume path and forwards the decision to the ACP permission
+/// store instead (the engine has no thread to resume).
+pub const ACP_PERMISSION_GATE_NAME: &str = "acp_permission";
+
+/// Read-only handle to the engine's `PendingGateStore`.
+///
+/// Returns `None` before `init_engine` has run. Intended for non-engine
+/// subsystems (orchestrator, channels) that need to insert or read gates
+/// after engine init without threading the `Arc` through setup ordering.
+pub async fn engine_pending_gate_store() -> Option<Arc<crate::gate::store::PendingGateStore>> {
+    let lock = ENGINE_STATE.get()?;
+    let guard = lock.read().await;
+    guard.as_ref().map(|s| Arc::clone(&s.pending_gates))
+}
+
+/// Peek at the gate registered with the given `(user_id, thread_id)` key
+/// by `request_id`, returning a clone of the stored `PendingGate` if the
+/// request id matches and the gate is not expired. Intended for handlers
+/// that need to inspect `gate_name` before choosing a resume path. Does
+/// NOT remove the gate — call [`take_verified_acp_permission_gate`] after
+/// routing to consume it atomically.
+pub async fn peek_pending_gate_by_request_id(
+    user_id: &str,
+    thread_id: &str,
+    request_id: uuid::Uuid,
+) -> Option<PendingGate> {
+    let thread_uuid = uuid::Uuid::parse_str(thread_id).ok()?;
+    let key = crate::gate::pending::PendingGateKey {
+        user_id: user_id.to_string(),
+        thread_id: ironclaw_engine::ThreadId(thread_uuid),
+    };
+    let lock = ENGINE_STATE.get()?;
+    let guard = lock.read().await;
+    let state = guard.as_ref()?;
+    // peek returns a view; fetch the full gate by scanning list_for_user so
+    // we can compare request_id and expose the internal fields the ACP
+    // handler needs. List is bounded by per-user gates — tiny.
+    let gates = state.pending_gates.list_for_user(user_id).await;
+    gates
+        .into_iter()
+        .find(|g| g.request_id == request_id && g.key() == key)
+}
+
+/// Atomically consume an `acp_permission` gate. Returns the `PendingGate`
+/// if present, of kind `acp_permission`, and owned by `user_id` +
+/// `thread_id`. Any other gate kind returns `None` without touching the
+/// store.
+pub async fn take_verified_acp_permission_gate(
+    user_id: &str,
+    thread_id: &str,
+    request_id: uuid::Uuid,
+) -> Result<Option<PendingGate>, crate::gate::store::GateStoreError> {
+    let Some(gate) = peek_pending_gate_by_request_id(user_id, thread_id, request_id).await else {
+        return Ok(None);
+    };
+    if gate.gate_name != ACP_PERMISSION_GATE_NAME {
+        return Ok(None);
+    }
+    let Some(lock) = ENGINE_STATE.get() else {
+        return Ok(None);
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return Ok(None);
+    };
+    let key = gate.key();
+    let taken = state
+        .pending_gates
+        .take_verified(&key, request_id, "web")
+        .await?;
+    Ok(Some(taken))
 }
 
 /// Check whether the user has *any* pending gate (resolved, ambiguous, or
@@ -3989,6 +4081,7 @@ async fn await_thread_outcome(
                     resume_output: None,
                     paused_lease: None,
                     approval_already_granted: false,
+                    job_id: None,
                 };
                 let pending_request_id = pending.request_id.to_string();
                 if let Err(e) = state.pending_gates.insert(pending).await {
@@ -4130,6 +4223,7 @@ async fn await_thread_outcome(
                 // enum compact; `PendingGate` stores it unboxed.
                 paused_lease: paused_lease.map(|b| *b),
                 approval_already_granted: false,
+                job_id: None,
             };
 
             if let Err(e) = state.pending_gates.insert(pending.clone()).await {
@@ -6728,6 +6822,7 @@ mod tests {
             resume_output: None,
             paused_lease: None,
             approval_already_granted: false,
+            job_id: None,
         }
     }
 
@@ -10693,5 +10788,52 @@ mod tests {
         );
         let info = thread_to_info(&thread);
         assert_eq!(info.title.as_deref(), Some("Short first line"));
+    }
+
+    #[test]
+    fn pending_gate_to_app_event_projects_acp_permission_gate() {
+        // Ensure the extracted helper projects the fields needed for the
+        // web UI to render an ACP permission card. The orchestrator ACP
+        // permission handler reuses this helper as the sole projection of
+        // a `PendingGate` into `AppEvent::GateRequired`.
+        let thread_id = ironclaw_engine::ThreadId::new();
+        let request_id = uuid::Uuid::new_v4();
+        let mut pending = sample_pending_gate_with_request_id(
+            "user-1",
+            thread_id,
+            request_id,
+            ironclaw_engine::ResumeKind::Approval { allow_always: true },
+        );
+        pending.gate_name = ACP_PERMISSION_GATE_NAME.into();
+        pending.action_name = "shell".into();
+        pending.description = "ACP agent wants to run shell".into();
+
+        let event = pending_gate_to_app_event(&pending, None);
+        match event {
+            AppEvent::GateRequired {
+                request_id: rid,
+                gate_name,
+                tool_name,
+                description,
+                extension_name,
+                resume_kind,
+                thread_id: wire_tid,
+                ..
+            } => {
+                assert_eq!(rid, request_id.to_string());
+                assert_eq!(gate_name, ACP_PERMISSION_GATE_NAME);
+                assert_eq!(tool_name, "shell");
+                assert_eq!(description, "ACP agent wants to run shell");
+                assert!(extension_name.is_none());
+                // ResumeKind is externally-tagged — Approval { allow_always: true }
+                // serializes as {"Approval":{"allow_always":true}}.
+                assert_eq!(
+                    resume_kind["Approval"]["allow_always"],
+                    serde_json::Value::Bool(true)
+                );
+                assert!(wire_tid.is_some());
+            }
+            other => panic!("expected GateRequired, got {other:?}"),
+        }
     }
 }

@@ -650,6 +650,178 @@ async def hosted_oauth_refresh_server(
         home_tmpdir.cleanup()
 
 
+TEST_ACP_WORKER_IMAGE = "ironclaw-test-acp:latest"
+
+
+def _docker_and_image_available(image: str) -> tuple[bool, str]:
+    """Return (available, reason) for the ACP worker image.
+
+    We need Docker reachable and the test worker image present locally.
+    The image is built by the developer as part of the test setup — we
+    don't build it here because build time dominates test runtime and
+    would surprise CI runs that skip Docker. Skip cleanly when absent.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", image],
+            capture_output=True,
+            timeout=10,
+        )
+    except FileNotFoundError:
+        return False, "docker CLI not found in PATH"
+    except subprocess.TimeoutExpired:
+        return False, "docker image inspect timed out"
+    if result.returncode != 0:
+        return (
+            False,
+            f"Docker image '{image}' not found locally. Build it with:\n"
+            f"  docker build -f Dockerfile.worker -t ironclaw-worker:latest .\n"
+            f"  cargo build -p test_acp_agent --release\n"
+            f"  docker build -f tests/fixtures/Dockerfile.test-acp-worker "
+            f"-t {image} .",
+        )
+    return True, ""
+
+
+@pytest.fixture(scope="session")
+async def acp_e2e_server(
+    ironclaw_binary,
+    mock_llm_server,
+    wasm_tools_dir,
+):
+    """Start an ironclaw instance wired for real ACP job execution.
+
+    Requires Docker and the ``ironclaw-test-acp:latest`` worker image.
+    The image packages ``test_acp_agent`` — a minimal ACP agent that
+    always defers its prompts to ``session/request_permission`` — so
+    each job produced by this fixture raises a real ``PendingGate``
+    that the Jobs-tab UI should surface. Skips cleanly when Docker
+    or the image is unavailable.
+    """
+    available, reason = _docker_and_image_available(TEST_ACP_WORKER_IMAGE)
+    if not available:
+        pytest.skip(reason)
+
+    reserved = _reserve_loopback_sockets(2)
+    db_tmpdir = tempfile.TemporaryDirectory(prefix="ironclaw-e2e-acp-db-")
+    home_tmpdir = tempfile.TemporaryDirectory(prefix="ironclaw-e2e-acp-home-")
+
+    try:
+        gateway_port = reserved[0].getsockname()[1]
+        http_port = reserved[1].getsockname()[1]
+        for sock in reserved:
+            if sock.fileno() != -1:
+                sock.close()
+
+        home_dir = home_tmpdir.name
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": home_dir,
+            "IRONCLAW_BASE_DIR": os.path.join(home_dir, ".ironclaw"),
+            "RUST_LOG": os.environ.get("ACP_E2E_RUST_LOG", "ironclaw=info"),
+            "RUST_BACKTRACE": "1",
+            "IRONCLAW_OWNER_ID": OWNER_SCOPE_ID,
+            "GATEWAY_ENABLED": "true",
+            "GATEWAY_HOST": "127.0.0.1",
+            "GATEWAY_PORT": str(gateway_port),
+            "GATEWAY_AUTH_TOKEN": AUTH_TOKEN,
+            "GATEWAY_USER_ID": OWNER_SCOPE_ID,
+            "HTTP_HOST": "127.0.0.1",
+            "HTTP_PORT": str(http_port),
+            "HTTP_WEBHOOK_SECRET": HTTP_WEBHOOK_SECRET,
+            "CLI_ENABLED": "false",
+            "LLM_BACKEND": "openai_compatible",
+            "LLM_BASE_URL": mock_llm_server,
+            "LLM_MODEL": "mock-model",
+            # Satisfies `unusable_reason` — without any api_key / oauth_token /
+            # refresh_token the provider is flagged unusable and startup falls
+            # back to NearAI, which then prompts for OAuth and blocks the job.
+            "LLM_API_KEY": "e2e-test-dummy",
+            "DATABASE_BACKEND": "libsql",
+            "LIBSQL_PATH": os.path.join(db_tmpdir.name, "acp-e2e.db"),
+            # ACP jobs need the orchestrator's container path; the sandbox
+            # image is the test worker image built with test_acp_agent baked in.
+            "SANDBOX_ENABLED": "true",
+            "SANDBOX_IMAGE": TEST_ACP_WORKER_IMAGE,
+            "ACP_ENABLED": "true",
+            "SKILLS_ENABLED": "true",
+            "ROUTINES_ENABLED": "false",
+            "HEARTBEAT_ENABLED": "false",
+            "EMBEDDING_ENABLED": "false",
+            "WASM_ENABLED": "false",
+            "ONBOARD_COMPLETED": "true",
+        }
+        _forward_coverage_env(env)
+
+        proc = await asyncio.create_subprocess_exec(
+            ironclaw_binary, "--no-onboard",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        base_url = f"http://127.0.0.1:{gateway_port}"
+
+        try:
+            await wait_for_ready(f"{base_url}/api/health", timeout=60)
+        except TimeoutError:
+            if proc.returncode is None:
+                await _stop_process(proc, timeout=2)
+            stderr_bytes = b""
+            if proc.stderr:
+                try:
+                    stderr_bytes = await asyncio.wait_for(
+                        proc.stderr.read(8192), timeout=2
+                    )
+                except asyncio.TimeoutError:
+                    pass
+            pytest.fail(
+                "acp_e2e ironclaw server failed to start.\n"
+                f"stderr:\n{stderr_bytes.decode('utf-8', errors='replace')}"
+            )
+
+        # Seed the ACP agent config via the settings API. Points at the
+        # test-acp-agent binary baked into the worker image, with
+        # surface_permissions=true so the orchestrator raises gates
+        # instead of auto-approving inside the container.
+        acp_agents = {
+            "agents": [
+                {
+                    "name": "test-agent",
+                    "command": "/usr/local/bin/test-acp-agent",
+                    "args": [],
+                    "env": {},
+                    "enabled": True,
+                    "surface_permissions": True,
+                    "description": "e2e test ACP agent",
+                }
+            ],
+            "schema_version": 1,
+        }
+        async with httpx.AsyncClient() as client:
+            resp = await client.put(
+                f"{base_url}/api/settings/acp_agents",
+                headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
+                json={"value": acp_agents},
+                timeout=10,
+            )
+            assert resp.status_code in (200, 204), (
+                f"failed to seed acp_agents: {resp.status_code} {resp.text}"
+            )
+
+        yield base_url
+    finally:
+        if proc.returncode is None:
+            await _stop_process(proc, sig=signal.SIGINT, timeout=10)
+            if proc.returncode is None:
+                await _stop_process(proc, timeout=2)
+        for sock in reserved:
+            if sock.fileno() != -1:
+                sock.close()
+        db_tmpdir.cleanup()
+        home_tmpdir.cleanup()
+
+
 @pytest.fixture(scope="session")
 async def loop_limited_server(
     ironclaw_binary,
@@ -1204,6 +1376,16 @@ async def loop_limited_page(loop_limited_server, browser):
     context = await browser.new_context(viewport={"width": 1280, "height": 720})
     pg = await context.new_page()
     await _open_authed_gateway_page(pg, loop_limited_server)
+    yield pg
+    await context.close()
+
+
+@pytest.fixture
+async def acp_e2e_page(acp_e2e_server, browser):
+    """Fresh Playwright page bound to the ACP-enabled gateway fixture."""
+    context = await browser.new_context(viewport={"width": 1280, "height": 720})
+    pg = await context.new_page()
+    await _open_authed_gateway_page(pg, acp_e2e_server, wait_for_sse=True)
     yield pg
     await context.close()
 
